@@ -29,7 +29,12 @@ QUARANTINE_DIR = "/srv/exoria/quarantine"
 DB_PATH = "/srv/exoria/queue.db"
 
 SCAN_INTERVAL = 2
-WORKERS = 6
+
+# Nombre de workers NAS en parallèle.
+# 1 = tout dans le thread principal (pas de threads supplémentaires).
+# >1 = scanner + N workers chacun dans leur propre thread.
+WORKERS = 1
+
 MAX_RETRIES = 8
 RETRY_BACKOFF = 5
 
@@ -51,7 +56,8 @@ STABLE_FILE_SECONDS = 2
 # DURCISSEMENT SSH/SFTP (banner reset)
 # =========================
 
-NAS_MAX_SIMULT_CONNECT = 1      # réduit la rafale de connexions NAS
+# Nombre max de connexions NAS simultanées (= WORKERS en pratique, laisser à 1 sauf besoin).
+NAS_MAX_SIMULT_CONNECT = 1
 SSH_TIMEOUT = 20
 BANNER_TIMEOUT = 90
 AUTH_TIMEOUT = 30
@@ -65,12 +71,14 @@ KAFKA_BROKER = "192.168.88.4"
 KAFKA_BROKER_PORT = 9092
 KAFKA_TOPIC = "topic2"
 
-try:
-    from kafka import KafkaProducer
-    HAS_KAFKA = True
-except ImportError:
-    KafkaProducer = None
-    HAS_KAFKA = False
+# try:
+#     from kafka import KafkaProducer
+#     HAS_KAFKA = True
+# except ImportError:
+#     KafkaProducer = None
+#     HAS_KAFKA = False
+KafkaProducer = None
+HAS_KAFKA = False
 
 # =========================
 # LOG (maximum)
@@ -239,8 +247,7 @@ class NASClient:
             if self.is_alive():
                 return
 
-            log.debug("nas_connect_start host=%s port=%s user=%s", NAS_HOST, NAS_PORT, NAS_USER)
-            KAFKA.emit("SFTP_CONNECT_START", "ok", host=NAS_HOST, port=NAS_PORT, user=NAS_USER)
+            log.info("[NAS] Connexion au NAS %s:%s (utilisateur: %s)...", NAS_HOST, NAS_PORT, NAS_USER)
 
             NAS_CONNECT_SEM.acquire()
             try:
@@ -273,14 +280,12 @@ class NASClient:
                         self.ssh = ssh
                         self.sftp = ssh.open_sftp()
 
-                        log.debug("nas_connect_ok")
-                        KAFKA.emit("SFTP_CONNECTED", "ok", host=NAS_HOST, port=NAS_PORT, user=NAS_USER)
+                        log.info("[NAS] Connexion établie avec succès.")
                         return
 
                     except (paramiko.SSHException, ConnectionResetError, EOFError, OSError) as e:
                         last_err = e
-                        log.warning("nas_connect_retry attempt=%d err=%s", attempt, e)
-                        KAFKA.emit("SFTP_CONNECT_RETRY", "warn", attempt=attempt, error=str(e))
+                        log.warning("[NAS] Echec de connexion (tentative %d/5) : %s", attempt, e)
 
                         try:
                             if self.ssh:
@@ -295,8 +300,7 @@ class NASClient:
                 raise RuntimeError(f"NAS connect failed: {last_err}")
 
             except Exception as e:
-                log.error("nas_connect_fail %s\n%s", e, traceback.format_exc())
-                KAFKA.emit("SFTP_CONNECT_FAIL", "error", host=NAS_HOST, port=NAS_PORT, user=NAS_USER, error=str(e))
+                log.error("[NAS] Impossible de se connecter au NAS après 5 tentatives : %s\n%s", e, traceback.format_exc())
                 NAS_CONNECT_SEM.release()
                 raise
 
@@ -353,10 +357,13 @@ class NASClient:
         directory = posixpath.dirname(remote)
         self.mkdir_p(directory)
 
+        size = os.path.getsize(local)
         tmp = remote + ".part"
-        log.debug("nas_put_upload_start local=%s tmp=%s", local, tmp)
+        log.info("[NAS] Envoi du fichier '%s' (%d octets) vers NAS...", os.path.basename(local), size)
+        log.debug("[NAS] Chemin local : %s", local)
+        log.debug("[NAS] Chemin distant temporaire : %s", tmp)
         self.sftp.put(local, tmp)
-        log.debug("nas_put_upload_done local=%s tmp=%s", local, tmp)
+        log.info("[NAS] Transfert terminé pour '%s'", os.path.basename(local))
 
         final = remote
         if self.exists(final):
@@ -365,11 +372,11 @@ class NASClient:
             while self.exists(f"{base}.dup{i}"):
                 i += 1
             final = f"{base}.dup{i}"
-            log.debug("nas_put_target_exists base=%s chosen=%s", base, final)
+            log.warning("[NAS] Fichier '%s' existe déjà, renommé en '%s'", os.path.basename(base), os.path.basename(final))
 
-        log.debug("nas_put_rename tmp=%s final=%s", tmp, final)
+        log.debug("[NAS] Renommage : %s -> %s", tmp, final)
         self.sftp.rename(tmp, final)
-        log.debug("nas_put_complete final=%s", final)
+        log.info("[NAS] Fichier disponible sur le NAS : %s", final)
         return final
 
 # =========================
@@ -382,14 +389,12 @@ class Scanner(threading.Thread):
         self.conn = conn
 
     def run(self):
-        log.info("scanner_start inbox=%s", INBOX_DIR)
-        KAFKA.emit("SCANNER_START", "ok", inbox=INBOX_DIR)
+        log.info("[Scanner] Démarrage — surveillance du dossier : %s", INBOX_DIR)
         while True:
             try:
                 self.scan()
             except Exception as e:
-                log.error("scanner_error %s\n%s", e, traceback.format_exc())
-                KAFKA.emit("SCANNER_ERROR", "error", error=str(e))
+                log.error("[Scanner] Erreur inattendue : %s\n%s", e, traceback.format_exc())
             time.sleep(SCAN_INTERVAL)
 
     def scan(self):
@@ -400,35 +405,23 @@ class Scanner(threading.Thread):
             for f in files:
                 src = os.path.join(root, f)
                 if f.endswith(".part") or f.endswith(".tmp"):
-                    log.debug("scanner_skip_tmp %s", src)
+                    log.debug("[Scanner] Fichier temporaire ignoré : %s", src)
                     continue
 
-                log.debug("scanner_detected sender=%s path=%s", sender, src)
-                KAFKA.emit("FILE_DETECTED", "ok", sender=sender, path=src, name=f)
+                log.debug("[Scanner] Fichier détecté — expéditeur=%s fichier=%s", sender, f)
 
                 if not stable(src):
-                    log.debug("scanner_not_stable %s", src)
-                    KAFKA.emit("FILE_NOT_STABLE", "warn", sender=sender, path=src, name=f)
+                    log.debug("[Scanner] Fichier pas encore stable (écriture en cours) : %s", src)
                     continue
-
-                KAFKA.emit("FILE_STABLE", "ok", sender=sender, path=src, name=f)
 
                 try:
                     jid = uuid.uuid4().hex
                     dst = os.path.join(SPOOL_DIR, jid + "__" + f)
 
-                    log.debug("scanner_move_start src=%s dst=%s", src, dst)
                     os.replace(src, dst)
-                    log.debug("scanner_move_done dst=%s", dst)
-                    KAFKA.emit("MOVED_TO_SPOOL", "ok", job_id=jid, sender=sender, src=src, dst=dst, name=f)
-
                     size = os.path.getsize(dst)
-                    log.debug("scanner_size job=%s size=%d", jid, size)
-
-                    log.debug("scanner_hash_start job=%s", jid)
+                    log.debug("[Scanner] Calcul SHA256 pour '%s'...", f)
                     h = sha256(dst)
-                    log.debug("scanner_hash_done job=%s sha256=%s", jid, h)
-                    KAFKA.emit("HASHED", "ok", job_id=jid, sender=sender, name=f, size=size, sha256=h)
 
                     self.conn.execute(
                         "INSERT INTO jobs VALUES (?,?,?,?,?,?,?,?,?,?,?)",
@@ -436,12 +429,10 @@ class Scanner(threading.Thread):
                     )
                     self.conn.commit()
 
-                    log.info("queued job=%s sender=%s file=%s size=%d sha=%s", jid, sender, f, size, h[:12])
-                    KAFKA.emit("QUEUED_DB", "ok", job_id=jid, sender=sender, name=f, size=size, sha256=h)
+                    log.info("[Scanner] Nouveau fichier mis en file : '%s' (%d octets) de '%s' [job=%s]", f, size, sender, jid[:8])
 
                 except Exception as e:
-                    log.error("scanner_enqueue_failed src=%s err=%s\n%s", src, e, traceback.format_exc())
-                    KAFKA.emit("SCAN_ENQUEUE_FAILED", "error", sender=sender, path=src, name=f, error=str(e))
+                    log.error("[Scanner] Impossible d'enregistrer le fichier '%s' : %s\n%s", src, e, traceback.format_exc())
 
 # =========================
 # WORKER — NAS persistent + reconnect/backoff
@@ -478,13 +469,11 @@ class Worker(threading.Thread):
         if not row2:
             return None
 
-        log.debug("job_claimed job=%s", jid)
-        KAFKA.emit("JOB_CLAIMED", "ok", job_id=jid, worker=self.idx)
+        log.debug("[Worker-%d] Job %s pris en charge.", self.idx, jid[:8])
         return row2
 
     def run(self):
-        log.info("worker_start idx=%s", self.idx)
-        KAFKA.emit("WORKER_START", "ok", worker=self.idx)
+        log.info("[Worker-%d] Démarrage.", self.idx)
 
         while True:
             job = self.get_job()
@@ -510,8 +499,7 @@ class Worker(threading.Thread):
                 self.nas.ensure()
                 return fn(*args, **kwargs)
             except (paramiko.SSHException, ConnectionResetError, EOFError, OSError) as e:
-                log.warning("nas_call_fail op=%s attempt=%d err=%s", op, attempt, e)
-                KAFKA.emit("NAS_CALL_FAIL", "warn", op=op, attempt=attempt, error=str(e))
+                log.warning("[NAS] Opération '%s' échouée (tentative %d/5) : %s", op, attempt, e)
                 try:
                     self.nas.close()
                 except Exception:
@@ -529,23 +517,20 @@ class Worker(threading.Thread):
         attempts_prev = job[7]
         attempts = attempts_prev + 1
 
-        log.info("process_start job=%s attempt=%d sender=%s file=%s", jid, attempts, sender, name)
-        KAFKA.emit("PROCESS_START", "ok", job_id=jid, attempt=attempts, sender=sender, name=name, size=size)
+        log.info("[JOB %s] Traitement démarré — fichier='%s' expéditeur='%s' tentative=%d", jid[:8], name, sender, attempts)
 
         try:
             if not os.path.exists(path):
                 raise Exception("missing file")
 
-            log.debug("hash_verify_start job=%s path=%s", jid, path)
+            log.debug("[JOB %s] Vérification intégrité SHA256...", jid[:8])
             h2 = sha256(path)
             if h2 != sha:
                 raise Exception("hash mismatch")
-            log.debug("hash_verify_ok job=%s", jid)
-            KAFKA.emit("HASH_VERIFIED", "ok", job_id=jid, sender=sender, name=name, sha256=sha)
+            log.debug("[JOB %s] Intégrité OK.", jid[:8])
 
             remote, manifest_remote, remote_dir = self.build_remote(sender, name)
-            log.debug("remote_paths job=%s remote=%s manifest=%s", jid, remote, manifest_remote)
-            KAFKA.emit("REMOTE_PATHS_READY", "ok", job_id=jid, sender=sender, remote=remote, manifest=manifest_remote)
+            log.debug("[JOB %s] Dossier NAS cible : %s", jid[:8], remote_dir)
 
             manifest_local = path + ".manifest.json"
             data = {
@@ -556,22 +541,19 @@ class Worker(threading.Thread):
                 "size_bytes": size,
                 "time": now_iso(),
             }
-            log.debug("manifest_write_start job=%s local=%s", jid, manifest_local)
             with open(manifest_local, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            log.debug("manifest_write_done job=%s", jid)
-            KAFKA.emit("MANIFEST_WRITTEN", "ok", job_id=jid, sender=sender, manifest_local=manifest_local)
+            log.debug("[JOB %s] Manifeste créé localement.", jid[:8])
 
-            KAFKA.emit("REMOTE_DIR_READY", "ok", job_id=jid, remote_dir=remote_dir)
             self._nas_call("MKDIR_REMOTE", self.nas.mkdir_p, remote_dir)
 
-            KAFKA.emit("UPLOAD_FILE_START", "ok", job_id=jid, local=path, remote=remote)
+            log.info("[JOB %s] Envoi du fichier '%s' vers le NAS...", jid[:8], name)
             final_remote = self._nas_call("UPLOAD_FILE", self.nas.put_atomic, path, remote)
-            KAFKA.emit("UPLOAD_FILE_DONE", "ok", job_id=jid, remote=final_remote)
+            log.info("[JOB %s] Fichier '%s' envoyé avec succès -> %s", jid[:8], name, final_remote)
 
-            KAFKA.emit("UPLOAD_MANIFEST_START", "ok", job_id=jid, local=manifest_local, remote=manifest_remote)
+            log.debug("[JOB %s] Envoi du manifeste vers le NAS...", jid[:8])
             final_manifest = self._nas_call("UPLOAD_MANIFEST", self.nas.put_atomic, manifest_local, manifest_remote)
-            KAFKA.emit("UPLOAD_MANIFEST_DONE", "ok", job_id=jid, remote=final_manifest)
+            log.debug("[JOB %s] Manifeste envoyé -> %s", jid[:8], final_manifest)
 
             self.conn.execute(
                 "UPDATE jobs SET status='done', updated_at=? WHERE id=?",
@@ -579,30 +561,24 @@ class Worker(threading.Thread):
             )
             self.conn.commit()
 
-            log.info("process_done job=%s remote=%s", jid, final_remote)
-            KAFKA.emit("JOB_DONE", "ok", job_id=jid, sender=sender, name=name, remote=final_remote)
+            log.info("[JOB %s] Traitement terminé avec succès — fichier disponible sur le NAS : %s", jid[:8], final_remote)
 
             try:
                 os.remove(manifest_local)
-                log.debug("cleanup_manifest_removed job=%s", jid)
-                KAFKA.emit("CLEANUP_MANIFEST", "ok", job_id=jid)
+                log.debug("[JOB %s] Manifeste local supprimé.", jid[:8])
             except Exception as ce:
-                log.warning("cleanup_manifest_failed job=%s err=%s", jid, ce)
-                KAFKA.emit("CLEANUP_MANIFEST", "warn", job_id=jid, error=str(ce))
+                log.warning("[JOB %s] Impossible de supprimer le manifeste local : %s", jid[:8], ce)
 
             if DELETE_LOCAL_AFTER_SUCCESS:
                 try:
                     os.remove(path)
-                    log.debug("cleanup_file_removed job=%s", jid)
-                    KAFKA.emit("CLEANUP_FILE", "ok", job_id=jid)
+                    log.debug("[JOB %s] Fichier local supprimé après envoi réussi.", jid[:8])
                 except Exception as ce:
-                    log.warning("cleanup_file_failed job=%s err=%s", jid, ce)
-                    KAFKA.emit("CLEANUP_FILE", "warn", job_id=jid, error=str(ce))
+                    log.warning("[JOB %s] Impossible de supprimer le fichier local : %s", jid[:8], ce)
 
         except Exception as e:
             err = str(e)
-            log.warning("process_failed job=%s attempt=%d err=%s\n%s", jid, attempts, err, traceback.format_exc())
-            KAFKA.emit("PROCESS_FAILED", "error", job_id=jid, attempt=attempts, sender=sender, name=name, error=err)
+            log.warning("[JOB %s] Echec tentative %d/%d — %s\n%s", jid[:8], attempts, MAX_RETRIES, err, traceback.format_exc())
 
             if attempts < MAX_RETRIES:
                 self.conn.execute(
@@ -611,8 +587,7 @@ class Worker(threading.Thread):
                 )
                 self.conn.commit()
 
-                log.info("retry_scheduled job=%s attempt=%d backoff=%ds", jid, attempts, RETRY_BACKOFF)
-                KAFKA.emit("RETRY_SCHEDULED", "warn", job_id=jid, attempt=attempts, backoff_s=RETRY_BACKOFF, error=err)
+                log.info("[JOB %s] Nouvelle tentative dans %ds (%d/%d).", jid[:8], RETRY_BACKOFF, attempts, MAX_RETRIES)
                 time.sleep(RETRY_BACKOFF)
                 return
 
@@ -622,20 +597,17 @@ class Worker(threading.Thread):
 
                 if os.path.exists(path):
                     shutil.move(path, q)
-                    log.info("quarantine_local job=%s path=%s", jid, q)
-                    KAFKA.emit("QUARANTINED_LOCAL", "warn", job_id=jid, local=q)
+                    log.warning("[JOB %s] Fichier '%s' mis en quarantaine locale : %s", jid[:8], name, q)
 
                 if COPY_TO_NAS_QUARANTINE and os.path.exists(q):
                     base = SFTP_BASE_DIR.rstrip("/")
                     remote_q = posixpath.join(base, QUARANTINE_ZONE, sender, os.path.basename(q))
-                    KAFKA.emit("UPLOAD_QUARANTINE_START", "warn", job_id=jid, local=q, remote=remote_q)
+                    log.warning("[JOB %s] Envoi en quarantaine NAS : %s", jid[:8], remote_q)
                     final_q = self._nas_call("UPLOAD_QUARANTINE", self.nas.put_atomic, q, remote_q)
-                    KAFKA.emit("UPLOAD_QUARANTINE_DONE", "warn", job_id=jid, remote=final_q)
-                    log.info("quarantine_nas job=%s remote=%s", jid, final_q)
+                    log.warning("[JOB %s] Fichier en quarantaine NAS : %s", jid[:8], final_q)
 
             except Exception as e2:
-                log.error("quarantine_failed job=%s err=%s\n%s", jid, e2, traceback.format_exc())
-                KAFKA.emit("QUARANTINE_FAILED", "error", job_id=jid, error=str(e2))
+                log.error("[JOB %s] Echec mise en quarantaine : %s\n%s", jid[:8], e2, traceback.format_exc())
 
             self.conn.execute(
                 "UPDATE jobs SET status='failed', attempts=?, last_error=?, updated_at=? WHERE id=?",
@@ -643,8 +615,7 @@ class Worker(threading.Thread):
             )
             self.conn.commit()
 
-            log.error("job_failed_final job=%s attempts=%d", jid, attempts)
-            KAFKA.emit("JOB_FAILED_FINAL", "error", job_id=jid, attempts=attempts, error=err)
+            log.error("[JOB %s] Job définitivement échoué après %d tentatives.", jid[:8], attempts)
 
 # =========================
 # MAIN
@@ -656,17 +627,34 @@ def main():
     os.makedirs(QUARANTINE_DIR, exist_ok=True)
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
-    log.info("app_start inbox=%s spool=%s quarantine=%s db=%s", INBOX_DIR, SPOOL_DIR, QUARANTINE_DIR, DB_PATH)
-    KAFKA.emit("APP_START", "ok", inbox=INBOX_DIR, spool=SPOOL_DIR, quarantine=QUARANTINE_DIR, db=DB_PATH)
+    log.info("[App] Démarrage — inbox=%s  spool=%s  quarantine=%s  db=%s", INBOX_DIR, SPOOL_DIR, QUARANTINE_DIR, DB_PATH)
+    log.info("[App] Mode : %d worker(s)", WORKERS)
 
     conn = db()
-    Scanner(conn).start()
 
-    for i in range(WORKERS):
-        Worker(i + 1, db()).start()
-
-    while True:
-        time.sleep(60)
+    if WORKERS == 1:
+        # Tout dans le thread principal : scan puis process en boucle
+        log.info("[App] Démarrage en mode mono-thread.")
+        scanner = Scanner(conn)
+        worker = Worker(1, conn)
+        while True:
+            try:
+                scanner.scan()
+            except Exception as e:
+                log.error("[Scanner] Erreur inattendue : %s\n%s", e, traceback.format_exc())
+            job = worker.get_job()
+            if job:
+                worker.process(job)
+            else:
+                time.sleep(SCAN_INTERVAL)
+    else:
+        # Mode multi-thread : scanner + N workers chacun dans leur thread
+        log.info("[App] Démarrage en mode multi-thread (%d workers).", WORKERS)
+        Scanner(conn).start()
+        for i in range(WORKERS):
+            Worker(i + 1, db()).start()
+        while True:
+            time.sleep(60)
 
 if __name__ == "__main__":
     main()
