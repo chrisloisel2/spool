@@ -73,14 +73,12 @@ KAFKA_BROKER = "192.168.88.4"
 KAFKA_BROKER_PORT = 9092
 KAFKA_TOPIC = "topic2"
 
-# try:
-#     from kafka import KafkaProducer
-#     HAS_KAFKA = True
-# except ImportError:
-#     KafkaProducer = None
-#     HAS_KAFKA = False
-KafkaProducer = None
-HAS_KAFKA = True
+try:
+    from kafka import KafkaProducer
+    HAS_KAFKA = True
+except ImportError:
+    KafkaProducer = None
+    HAS_KAFKA = False
 
 # =========================
 # LOG (maximum)
@@ -144,11 +142,11 @@ class KafkaEmitter:
             self._producer = KafkaProducer(
                 bootstrap_servers=[f"{KAFKA_BROKER}:{KAFKA_BROKER_PORT}"],
                 value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode("utf-8"),
+                api_version=(2, 0, 0),
                 retries=10,
                 acks="all",
                 linger_ms=10,
                 request_timeout_ms=15000,
-                api_version_auto_timeout_ms=15000,
             )
 
     def emit(self, step: str, status: str, **fields):
