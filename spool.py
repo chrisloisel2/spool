@@ -343,51 +343,42 @@ class NASClient:
             try:
                 tcp_check(NAS_HOST, NAS_PORT, 3.0)
 
-                last_err = None
-                for attempt in range(1, 6):
+                try:
+                    ssh = paramiko.SSHClient()
+                    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                    ssh.connect(
+                        hostname=NAS_HOST,
+                        port=NAS_PORT,
+                        username=NAS_USER,
+                        password=NAS_PASS,
+                        look_for_keys=False,
+                        allow_agent=False,
+                        timeout=SSH_TIMEOUT,
+                        banner_timeout=BANNER_TIMEOUT,
+                        auth_timeout=AUTH_TIMEOUT,
+                    )
+
                     try:
-                        ssh = paramiko.SSHClient()
-                        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                        ssh.connect(
-                            hostname=NAS_HOST,
-                            port=NAS_PORT,
-                            username=NAS_USER,
-                            password=NAS_PASS,
-                            look_for_keys=False,
-                            allow_agent=False,
-                            timeout=SSH_TIMEOUT,
-                            banner_timeout=BANNER_TIMEOUT,
-                            auth_timeout=AUTH_TIMEOUT,
-                        )
+                        tr = ssh.get_transport()
+                        if tr:
+                            tr.set_keepalive(KEEPALIVE_SEC)
+                    except Exception:
+                        pass
 
-                        try:
-                            tr = ssh.get_transport()
-                            if tr:
-                                tr.set_keepalive(KEEPALIVE_SEC)
-                        except Exception:
-                            pass
+                    self.ssh = ssh
+                    self.sftp = ssh.open_sftp()
 
-                        self.ssh = ssh
-                        self.sftp = ssh.open_sftp()
+                    log.info("[NAS] Connexion établie avec succès.")
 
-                        log.info("[NAS] Connexion établie avec succès.")
-                        return
-
-                    except (paramiko.SSHException, ConnectionResetError, EOFError, OSError) as e:
-                        last_err = e
-                        log.warning("[NAS] Echec de connexion (tentative %d/5) : %s", attempt, e)
-
-                        try:
-                            if self.ssh:
-                                self.ssh.close()
-                        except Exception:
-                            pass
-                        self.ssh = None
-                        self.sftp = None
-
-                        time.sleep(min(30, attempt * 3.0) + random.random())
-
-                raise RuntimeError(f"NAS connect failed: {last_err}")
+                except (paramiko.SSHException, ConnectionResetError, EOFError, OSError) as e:
+                    try:
+                        if self.ssh:
+                            self.ssh.close()
+                    except Exception:
+                        pass
+                    self.ssh = None
+                    self.sftp = None
+                    raise RuntimeError(f"NAS connect failed: {e}")
 
             except Exception as e:
                 log.error("[NAS] Impossible de se connecter au NAS après 5 tentatives : %s\n%s", e, traceback.format_exc())
