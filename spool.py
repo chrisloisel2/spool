@@ -3,6 +3,7 @@
 
 import os
 import re
+import sys
 import time
 import uuid
 import json
@@ -10,6 +11,7 @@ import shutil
 import hashlib
 import sqlite3
 import logging
+import argparse
 import threading
 import datetime as dt
 import posixpath
@@ -621,7 +623,31 @@ class Worker(threading.Thread):
 # MAIN
 # =========================
 
+def reset_db():
+    if not os.path.exists(DB_PATH):
+        print(f"Rien à supprimer ({DB_PATH} n'existe pas).")
+        return
+    answer = input(f"Supprimer la base de données {DB_PATH} ? [oui/non] : ").strip().lower()
+    if answer != "oui":
+        print("Annulé.")
+        sys.exit(0)
+    os.remove(DB_PATH)
+    print(f"Base supprimée : {DB_PATH}")
+    print("Relance le programme sans --reset pour repartir à zéro.")
+    sys.exit(0)
+
 def main():
+    parser = argparse.ArgumentParser(description="Spool — transfert fichiers vers NAS")
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="Supprime la base de données et repart à zéro (demande confirmation).",
+    )
+    args = parser.parse_args()
+
+    if args.reset:
+        reset_db()
+
     os.makedirs(INBOX_DIR, exist_ok=True)
     os.makedirs(SPOOL_DIR, exist_ok=True)
     os.makedirs(QUARANTINE_DIR, exist_ok=True)
@@ -633,7 +659,6 @@ def main():
     conn = db()
 
     if WORKERS == 1:
-        # Tout dans le thread principal : scan puis process en boucle
         log.info("[App] Démarrage en mode mono-thread.")
         scanner = Scanner(conn)
         worker = Worker(1, conn)
@@ -648,7 +673,6 @@ def main():
             else:
                 time.sleep(SCAN_INTERVAL)
     else:
-        # Mode multi-thread : scanner + N workers chacun dans leur thread
         log.info("[App] Démarrage en mode multi-thread (%d workers).", WORKERS)
         Scanner(conn).start()
         for i in range(WORKERS):
