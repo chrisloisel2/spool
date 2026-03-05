@@ -183,6 +183,96 @@ class KafkaEmitter:
 KAFKA = KafkaEmitter()
 
 # =========================
+# SPOOL REPORTER — snapshot périodique vers topic2
+# =========================
+
+REPORTER_INTERVAL = 5  # secondes entre chaque snapshot
+
+class SpoolReporter(threading.Thread):
+    """
+    Maintient l'état courant du spool et publie un snapshot complet
+    sur topic2 toutes les REPORTER_INTERVAL secondes.
+    Format : { source, timestamp, inbound_queue, processed_today,
+               forwarded_to_nas, failed, current_transfer }
+    """
+
+    def __init__(self):
+        super().__init__(daemon=True, name="spool-reporter")
+        self._lock = threading.Lock()
+        self._inbound_queue = []   # list of dicts {pc_id, session_id, received_at, size_mb}
+        self._processed_today = 0
+        self._forwarded_to_nas = 0
+        self._failed = 0
+        self._current_transfer = None  # dict or None
+
+    # --- méthodes appelées par Scanner / Worker ---
+
+    def set_inbound_queue(self, entries: list):
+        """Remplace la file d'attente entière (appelé par Scanner après chaque scan)."""
+        with self._lock:
+            self._inbound_queue = list(entries)
+
+    def set_current_transfer(self, info: dict | None):
+        """Met à jour le transfert en cours (dict ou None)."""
+        with self._lock:
+            self._current_transfer = info
+
+    def inc_processed(self):
+        with self._lock:
+            self._processed_today += 1
+
+    def inc_forwarded(self):
+        with self._lock:
+            self._forwarded_to_nas += 1
+
+    def inc_failed(self):
+        with self._lock:
+            self._failed += 1
+
+    # --- boucle principale ---
+
+    def run(self):
+        log.info("[Reporter] Démarrage — intervalle=%ds topic=%s", REPORTER_INTERVAL, KAFKA_TOPIC)
+        while True:
+            try:
+                self._emit()
+            except Exception as e:
+                log.warning("[Reporter] Erreur lors de l'émission : %s", e)
+            time.sleep(REPORTER_INTERVAL)
+
+    def _emit(self):
+        with self._lock:
+            msg = {
+                "source": "spool",
+                "timestamp": now_iso(),
+                "inbound_queue": list(self._inbound_queue),
+                "processed_today": self._processed_today,
+                "forwarded_to_nas": self._forwarded_to_nas,
+                "failed": self._failed,
+                "current_transfer": self._current_transfer,
+            }
+
+        log.debug("[Reporter] Snapshot : queue=%d processed=%d forwarded=%d failed=%d transfer=%s",
+                  len(msg["inbound_queue"]), msg["processed_today"],
+                  msg["forwarded_to_nas"], msg["failed"],
+                  msg["current_transfer"])
+
+        if not HAS_KAFKA:
+            return
+
+        try:
+            KAFKA._ensure()
+            if not KAFKA._producer:
+                return
+            KAFKA._producer.send(KAFKA_TOPIC, msg)
+            KAFKA._producer.flush(timeout=5)
+        except Exception as e:
+            log.warning("[Reporter] Kafka send failed : %s", e)
+
+
+REPORTER = SpoolReporter()
+
+# =========================
 # UTILS
 # =========================
 
@@ -436,6 +526,28 @@ class Scanner(threading.Thread):
                 except Exception as e:
                     log.error("[Scanner] Impossible d'enregistrer le fichier '%s' : %s\n%s", src, e, traceback.format_exc())
 
+        # Mise à jour de la file d'attente dans le reporter
+        try:
+            rows = self.conn.execute(
+                "SELECT id, sender, size_bytes, created_at FROM jobs WHERE status='queued' ORDER BY created_at ASC"
+            ).fetchall()
+            queue = []
+            for row in rows:
+                # pc_id : on essaie d'extraire un entier depuis sender, sinon 0
+                try:
+                    pc_id = int(row[1])
+                except (ValueError, TypeError):
+                    pc_id = 0
+                queue.append({
+                    "pc_id": pc_id,
+                    "session_id": row[0][:8],
+                    "received_at": row[3],
+                    "size_mb": round(row[2] / (1024 * 1024), 2) if row[2] else 0.0,
+                })
+            REPORTER.set_inbound_queue(queue)
+        except Exception as e:
+            log.debug("[Scanner] Reporter queue update failed: %s", e)
+
 # =========================
 # WORKER — NAS persistent + reconnect/backoff
 # =========================
@@ -521,6 +633,19 @@ class Worker(threading.Thread):
 
         log.info("[JOB %s] Traitement démarré — fichier='%s' expéditeur='%s' tentative=%d", jid[:8], name, sender, attempts)
 
+        # pc_id : extrait depuis sender si numérique
+        try:
+            pc_id = int(sender)
+        except (ValueError, TypeError):
+            pc_id = 0
+
+        REPORTER.set_current_transfer({
+            "from_pc": pc_id,
+            "session_id": jid[:8],
+            "progress_pct": 0,
+            "speed_mbps": 0.0,
+        })
+
         try:
             if not os.path.exists(path):
                 raise Exception("missing file")
@@ -549,9 +674,26 @@ class Worker(threading.Thread):
 
             self._nas_call("MKDIR_REMOTE", self.nas.mkdir_p, remote_dir)
 
+            REPORTER.set_current_transfer({
+                "from_pc": pc_id,
+                "session_id": jid[:8],
+                "progress_pct": 10,
+                "speed_mbps": 0.0,
+            })
+
             log.info("[JOB %s] Envoi du fichier '%s' vers le NAS...", jid[:8], name)
+            t_start = time.monotonic()
             final_remote = self._nas_call("UPLOAD_FILE", self.nas.put_atomic, path, remote)
+            elapsed = max(time.monotonic() - t_start, 0.001)
+            speed = round((size / (1024 * 1024)) / elapsed, 2)
             log.info("[JOB %s] Fichier '%s' envoyé avec succès -> %s", jid[:8], name, final_remote)
+
+            REPORTER.set_current_transfer({
+                "from_pc": pc_id,
+                "session_id": jid[:8],
+                "progress_pct": 90,
+                "speed_mbps": speed,
+            })
 
             log.debug("[JOB %s] Envoi du manifeste vers le NAS...", jid[:8])
             final_manifest = self._nas_call("UPLOAD_MANIFEST", self.nas.put_atomic, manifest_local, manifest_remote)
@@ -562,6 +704,10 @@ class Worker(threading.Thread):
                 (now_iso(), jid),
             )
             self.conn.commit()
+
+            REPORTER.inc_processed()
+            REPORTER.inc_forwarded()
+            REPORTER.set_current_transfer(None)
 
             log.info("[JOB %s] Traitement terminé avec succès — fichier disponible sur le NAS : %s", jid[:8], final_remote)
 
@@ -617,6 +763,10 @@ class Worker(threading.Thread):
             )
             self.conn.commit()
 
+            REPORTER.inc_processed()
+            REPORTER.inc_failed()
+            REPORTER.set_current_transfer(None)
+
             log.error("[JOB %s] Job définitivement échoué après %d tentatives.", jid[:8], attempts)
 
 # =========================
@@ -656,6 +806,7 @@ def main():
     log.info("[App] Démarrage — inbox=%s  spool=%s  quarantine=%s  db=%s", INBOX_DIR, SPOOL_DIR, QUARANTINE_DIR, DB_PATH)
     log.info("[App] Mode : %d worker(s)", WORKERS)
 
+    REPORTER.start()
     conn = db()
 
     if WORKERS == 1:
