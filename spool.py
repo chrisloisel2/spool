@@ -44,13 +44,13 @@ RETRY_BACKOFF = 5
 NAS_HOST = "192.168.88.248"
 NAS_PORT = 22
 NAS_USER = "EXORIA"
-NAS_PASS = "REPLACE_ME"  # mets ton mot de passe ici
+NAS_PASS = "NasExori@2026!!#"  # mets ton mot de passe ici
 
 SFTP_BASE_DIR = "/DB-EXORIA/lakehouse"
 LANDING_ZONE = "bronze/landing"
 QUARANTINE_ZONE = "bronze/quarantine"
 
-DELETE_LOCAL_AFTER_SUCCESS = False
+DELETE_LOCAL_AFTER_SUCCESS = True
 COPY_TO_NAS_QUARANTINE = True
 STABLE_FILE_SECONDS = 2
 
@@ -80,7 +80,7 @@ KAFKA_TOPIC = "topic2"
 #     KafkaProducer = None
 #     HAS_KAFKA = False
 KafkaProducer = None
-HAS_KAFKA = False
+HAS_KAFKA = True
 
 # =========================
 # LOG (maximum)
