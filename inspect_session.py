@@ -6,7 +6,7 @@ inspect_session.py
 Inspection complète d'une session robotique.
 
 Pipeline :
-  1. Lit la queue RabbitMQ  ingestion_queue
+  1. Lit la queue RabbitMQ  annotation_queue
   2. Pour chaque message : localise le dossier de session
   3. Vérifie l'intégrité structurelle et la cohérence des données
   4. Uploade sur le NAS (SFTP atomique)
@@ -67,7 +67,7 @@ RABBITMQ_PORT   = int(os.environ.get("RABBITMQ_PORT", "5672"))
 RABBITMQ_USER   = os.environ.get("RABBITMQ_USER",  "admin")
 RABBITMQ_PASS   = os.environ.get("RABBITMQ_PASS",  "Admin123456!")
 RABBITMQ_VHOST  = os.environ.get("RABBITMQ_VHOST", "/")
-RABBITMQ_QUEUE  = os.environ.get("RABBITMQ_QUEUE", "ingestion_queue")
+RABBITMQ_QUEUE  = os.environ.get("RABBITMQ_QUEUE", "annotation_queue")
 SCENARIOS_QUEUE = os.environ.get("SCENARIOS_QUEUE", "scenarios_queue")
 
 # ── NAS SFTP ──────────────────────────────────────────────────────────────────
@@ -809,6 +809,8 @@ def resolve_session_dir(body: Dict[str, Any]) -> Optional[str]:
       - "session_id"   : on cherche dans SESSIONS_ROOT
                          ex: "20260308_161838" → /srv/exoria/sessions/session_20260308_161838
       - "path"         : alias de session_dir
+      - chemins individuels (head_video, gripper_right, gripper_left, tracker, etc.)
+                         → on remonte au dossier parent de la session
     """
     if "session_dir" in body:
         return body["session_dir"]
@@ -824,6 +826,25 @@ def resolve_session_dir(body: Dict[str, Any]) -> Optional[str]:
             if os.path.isdir(c):
                 return c
         log.error("Session '%s' introuvable dans %s", sid, SESSIONS_ROOT)
+
+    # Reconstruction depuis les chemins individuels par fichier
+    FILE_KEYS = ("head_video", "left_video", "right_video",
+                 "head_jsonl", "left_jsonl", "right_jsonl",
+                 "gripper_right", "gripper_left", "tracker",
+                 "tracker_positions", "metadata")
+    for key in FILE_KEYS:
+        val = body.get(key)
+        if not val or not isinstance(val, str):
+            continue
+        # Remonte au dossier de session (qui peut être parent direct ou grand-parent pour videos/)
+        candidate = os.path.dirname(val)
+        if os.path.basename(candidate) == "videos":
+            candidate = os.path.dirname(candidate)
+        if os.path.isdir(candidate):
+            log.info("Session résolue depuis la clé '%s' : %s", key, candidate)
+            return candidate
+        log.debug("Candidat '%s' depuis clé '%s' non trouvé", candidate, key)
+
     return None
 
 

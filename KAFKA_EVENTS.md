@@ -60,7 +60,7 @@ Chaque message est un objet JSON avec les champs de base suivants, auxquels s'aj
   "kafka_broker":   "192.168.88.4:9092",
   "nas_host":       "192.168.88.248",
   "rabbitmq_host":  "192.168.88.4",
-  "rabbitmq_queue": "ingestion_queue"
+  "rabbitmq_queue": "annotation_queue"
 }
 ```
 
@@ -77,12 +77,12 @@ Le consumer RabbitMQ est connecté et écoute la queue.
   "status":          "started",
   "session_id":      "",
   "rabbitmq_host":   "192.168.88.4",
-  "rabbitmq_queue":  "ingestion_queue"
+  "rabbitmq_queue":  "annotation_queue"
 }
 ```
 
 #### `consumer / message_received`
-Un message a été dépilé de `ingestion_queue`.
+Un message a été dépilé de `annotation_queue`.
 
 ```json
 {
