@@ -62,12 +62,13 @@ except ImportError:
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── RabbitMQ ──────────────────────────────────────────────────────────────────
-RABBITMQ_HOST   = os.environ.get("RABBITMQ_HOST",  "192.168.88.4")
+RABBITMQ_HOST   = os.environ.get("RABBITMQ_HOST",  "192.168.88.246")
 RABBITMQ_PORT   = int(os.environ.get("RABBITMQ_PORT", "5672"))
-RABBITMQ_USER   = os.environ.get("RABBITMQ_USER",  "guest")
-RABBITMQ_PASS   = os.environ.get("RABBITMQ_PASS",  "guest")
+RABBITMQ_USER   = os.environ.get("RABBITMQ_USER",  "admin")
+RABBITMQ_PASS   = os.environ.get("RABBITMQ_PASS",  "Admin123456!")
 RABBITMQ_VHOST  = os.environ.get("RABBITMQ_VHOST", "/")
-RABBITMQ_QUEUE  = "ingestion_queue"
+RABBITMQ_QUEUE  = os.environ.get("RABBITMQ_QUEUE", "ingestion_queue")
+SCENARIOS_QUEUE = os.environ.get("SCENARIOS_QUEUE", "scenarios_queue")
 
 # ── NAS SFTP ──────────────────────────────────────────────────────────────────
 NAS_HOST        = os.environ.get("NAS_HOST",   "192.168.88.248")
@@ -826,6 +827,8 @@ def resolve_session_dir(body: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+RABBITMQ_RECONNECT_DELAY_MAX = 60   # secondes, plafond exponentiel
+
 def start_rabbitmq_consumer(once: bool = False) -> None:
     if not HAS_PIKA:
         raise RuntimeError("pika non installé — pip install pika")
@@ -838,19 +841,6 @@ def start_rabbitmq_consumer(once: bool = False) -> None:
         heartbeat=60,
         blocked_connection_timeout=300,
     )
-
-    log.info("[RABBITMQ] Connexion à %s:%s vhost=%s queue=%s",
-             RABBITMQ_HOST, RABBITMQ_PORT, RABBITMQ_VHOST, RABBITMQ_QUEUE)
-
-    conn = pika.BlockingConnection(params)
-    ch   = conn.channel()
-    ch.queue_declare(queue=RABBITMQ_QUEUE, durable=True)
-    ch.basic_qos(prefetch_count=1)
-
-    KAFKA.emit("consumer", "started",
-               session_id="",
-               rabbitmq_host=RABBITMQ_HOST,
-               rabbitmq_queue=RABBITMQ_QUEUE)
 
     def on_message(ch, method, properties, raw_body):
         delivery_tag = method.delivery_tag
@@ -898,20 +888,70 @@ def start_rabbitmq_consumer(once: bool = False) -> None:
             log.warning("[RABBITMQ] NACK delivery_tag=%d (requeue=False)", delivery_tag)
 
         if once:
-            conn.close()
+            raise KeyboardInterrupt  # sortie propre après un seul message
 
-    ch.basic_consume(queue=RABBITMQ_QUEUE, on_message_callback=on_message)
-    log.info("[RABBITMQ] En attente de messages sur '%s' ...", RABBITMQ_QUEUE)
-    try:
-        ch.start_consuming()
-    except KeyboardInterrupt:
-        log.info("[RABBITMQ] Arrêt demandé (KeyboardInterrupt)")
-        ch.stop_consuming()
-    finally:
+    # ── Boucle de reconnexion avec backoff exponentiel ────────────────────────
+    delay = 5
+    attempt = 0
+    while True:
+        attempt += 1
+        log.info("[RABBITMQ] Tentative de connexion #%d → %s:%s vhost=%s queue=%s",
+                 attempt, RABBITMQ_HOST, RABBITMQ_PORT, RABBITMQ_VHOST, RABBITMQ_QUEUE)
+        KAFKA.emit("consumer", "connecting",
+                   session_id="",
+                   rabbitmq_host=RABBITMQ_HOST,
+                   rabbitmq_queue=RABBITMQ_QUEUE,
+                   attempt=attempt)
+        conn = None
         try:
-            conn.close()
-        except Exception:
-            pass
+            conn = pika.BlockingConnection(params)
+            ch   = conn.channel()
+
+            # Création des queues si elles n'existent pas encore
+            ch.queue_declare(queue=RABBITMQ_QUEUE,  durable=True)
+            ch.queue_declare(queue=SCENARIOS_QUEUE, durable=True)
+            log.info("[RABBITMQ] Queues déclarées : %s, %s", RABBITMQ_QUEUE, SCENARIOS_QUEUE)
+
+            ch.basic_qos(prefetch_count=1)
+            ch.basic_consume(queue=RABBITMQ_QUEUE, on_message_callback=on_message)
+
+            delay = 5   # reset du backoff après connexion réussie
+            log.info("[RABBITMQ] Connecté. En attente de messages sur '%s' ...", RABBITMQ_QUEUE)
+            KAFKA.emit("consumer", "started",
+                       session_id="",
+                       rabbitmq_host=RABBITMQ_HOST,
+                       rabbitmq_queue=RABBITMQ_QUEUE,
+                       attempt=attempt)
+
+            ch.start_consuming()
+
+        except KeyboardInterrupt:
+            log.info("[RABBITMQ] Arrêt demandé.")
+            KAFKA.emit("consumer", "stopped", session_id="", reason="keyboard_interrupt")
+            try:
+                if conn and conn.is_open:
+                    conn.close()
+            except Exception:
+                pass
+            return  # sortie définitive
+
+        except Exception as e:
+            log.error("[RABBITMQ] Connexion perdue (tentative #%d) : %s — nouvelle tentative dans %ds",
+                      attempt, e, delay)
+            KAFKA.emit("consumer", "connection_lost",
+                       session_id="",
+                       attempt=attempt,
+                       error=str(e),
+                       retry_in_s=delay)
+        finally:
+            try:
+                if conn and conn.is_open:
+                    conn.close()
+            except Exception:
+                pass
+
+        time.sleep(delay)
+        delay = min(delay * 2, RABBITMQ_RECONNECT_DELAY_MAX)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CLI
