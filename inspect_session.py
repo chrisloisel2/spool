@@ -67,8 +67,9 @@ RABBITMQ_PORT   = int(os.environ.get("RABBITMQ_PORT", "5672"))
 RABBITMQ_USER   = os.environ.get("RABBITMQ_USER",  "admin")
 RABBITMQ_PASS   = os.environ.get("RABBITMQ_PASS",  "Admin123456!")
 RABBITMQ_VHOST  = os.environ.get("RABBITMQ_VHOST", "/")
-RABBITMQ_QUEUE  = os.environ.get("RABBITMQ_QUEUE", "annotation_queue")
-SCENARIOS_QUEUE = os.environ.get("SCENARIOS_QUEUE", "scenarios_queue")
+RABBITMQ_QUEUE    = os.environ.get("RABBITMQ_QUEUE",    "annotation_queue")
+SCENARIOS_QUEUE   = os.environ.get("SCENARIOS_QUEUE",   "scenarios_queue")
+INGESTION_QUEUE   = os.environ.get("INGESTION_QUEUE",   "ingestion_queue")
 
 # ── NAS SFTP ──────────────────────────────────────────────────────────────────
 NAS_HOST        = os.environ.get("NAS_HOST",   "192.168.88.248")
@@ -579,10 +580,12 @@ def build_nas_path(session_id: str, rel: str, zone: str = NAS_LANDING) -> str:
     return posixpath.join(base, zone, y, mo, d, session_id, rel)
 
 
-def upload_session(report: Dict[str, Any], zone: str = NAS_LANDING) -> Dict[str, Any]:
+def upload_session(report: Dict[str, Any], zone: str = NAS_LANDING) -> Tuple[Dict[str, Any], str]:
     """
     Uploade tous les fichiers de la session sur le NAS.
-    Retourne un dict {rel: {"remote": ..., "speed_mbps": ..., "sha256": ...}}
+    Retourne (upload_result, manifest_remote) où upload_result est un dict
+    {rel: {"remote": ..., "speed_mbps": ..., "sha256": ...}} et manifest_remote
+    est le chemin NAS du manifeste.
     """
     sid    = report["session_id"]
     sdir   = report["session_dir"]
@@ -717,7 +720,78 @@ def upload_session(report: Dict[str, Any], zone: str = NAS_LANDING) -> Dict[str,
     log.info("[UPLOAD %s] Upload terminé — %d fichiers, %.2f MB, moy %.2f MB/s",
              sid, len(result), human_mb(total_bytes), total_speed)
 
-    return result
+    return result, manifest_remote
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INGESTION QUEUE PUBLISHER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def publish_ingestion_job(
+    session_id: str,
+    zone: str,
+    upload_result: Dict[str, Any],
+    manifest_remote: str,
+) -> None:
+    """
+    Publie un job dans la RabbitMQ ingestion_queue décrivant tous les chemins
+    NAS des fichiers uploadés pour cette session.
+    """
+    if not HAS_PIKA:
+        log.warning("[INGESTION_QUEUE %s] pika non disponible — job non publié", session_id)
+        return
+
+    nas_paths = {
+        rel: info["remote"]
+        for rel, info in upload_result.items()
+        if info.get("ok") and info.get("remote")
+    }
+
+    message = {
+        "session_id":      session_id,
+        "zone":            zone,
+        "nas_paths":       nas_paths,
+        "manifest_remote": manifest_remote,
+        "created_at":      now_iso(),
+    }
+    body = json.dumps(message, ensure_ascii=False).encode("utf-8")
+
+    try:
+        params = pika.ConnectionParameters(
+            host=RABBITMQ_HOST,
+            port=RABBITMQ_PORT,
+            virtual_host=RABBITMQ_VHOST,
+            credentials=pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASS),
+            heartbeat=60,
+            connection_attempts=3,
+            retry_delay=2,
+        )
+        conn = pika.BlockingConnection(params)
+        ch   = conn.channel()
+        ch.queue_declare(queue=INGESTION_QUEUE, durable=True)
+        ch.basic_publish(
+            exchange="",
+            routing_key=INGESTION_QUEUE,
+            body=body,
+            properties=pika.BasicProperties(
+                delivery_mode=2,        # persistent
+                content_type="application/json",
+            ),
+        )
+        conn.close()
+        log.info("[INGESTION_QUEUE %s] Job publié (%d fichiers NAS)", session_id, len(nas_paths))
+        KAFKA.emit("ingestion_queue", "job_published",
+                   session_id=session_id,
+                   queue=INGESTION_QUEUE,
+                   zone=zone,
+                   files_count=len(nas_paths),
+                   manifest_remote=manifest_remote)
+    except Exception as e:
+        log.error("[INGESTION_QUEUE %s] Échec publication : %s", session_id, e)
+        KAFKA.emit("ingestion_queue", "publish_failed",
+                   session_id=session_id,
+                   queue=INGESTION_QUEUE,
+                   error=str(e))
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PIPELINE PRINCIPAL
@@ -747,7 +821,7 @@ def process_session(session_dir: str) -> bool:
                    failed_checks=report.get("failed_checks", []))
         # Upload en quarantaine quand même (avec les fichiers présents)
         try:
-            upload_session(report, zone=NAS_QUARANTINE)
+            upload_session(report, zone=NAS_QUARANTINE)  # tuple ignoré volontairement
         except Exception as e:
             KAFKA.emit("pipeline", "quarantine_upload_failed",
                        session_id=sid, error=str(e))
@@ -763,7 +837,7 @@ def process_session(session_dir: str) -> bool:
     # ── ÉTAPE 2 : Upload NAS (landing) ────────────────────────────────────────
     log.info("[PIPELINE %s] Étape 2 : Upload NAS → %s", sid, NAS_LANDING)
     try:
-        upload_result = upload_session(report, zone=NAS_LANDING)
+        upload_result, manifest_remote = upload_session(report, zone=NAS_LANDING)
     except Exception as e:
         log.error("[PIPELINE %s] Upload NAS échoué : %s", sid, e)
         KAFKA.emit("pipeline", "upload_failed",
@@ -777,6 +851,10 @@ def process_session(session_dir: str) -> bool:
                    session_id=sid, failed_files=failed_uploads)
         log.error("[PIPELINE %s] Fichiers non uploadés : %s", sid, failed_uploads)
         return False
+
+    # ── ÉTAPE 4 : Publication dans ingestion_queue ────────────────────────────
+    log.info("[PIPELINE %s] Étape 4 : Publication ingestion_queue", sid)
+    publish_ingestion_job(sid, NAS_LANDING, upload_result, manifest_remote)
 
     # ── Succès ────────────────────────────────────────────────────────────────
     KAFKA.emit("pipeline", "completed",
