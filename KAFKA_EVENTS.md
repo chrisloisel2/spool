@@ -5,13 +5,13 @@
 | Paramètre | Valeur par défaut |
 |-----------|-------------------|
 | Broker | `192.168.88.4:9092` |
-| Topic | `topic2` |
+| Topic | `monitoring` |
 | Source (champ) | `"inspect_session"` |
 | Acks | `all` |
 | Retries | `5` |
 | API version | `2.0` |
 
-Tous les messages sont publiés sur **`topic2`** (topic unique partagé avec `spool.py`).
+Tous les messages sont publiés sur **`monitoring`** (topic unique partagé avec `spool.py`).
 
 ---
 

@@ -71,7 +71,7 @@ KEEPALIVE_SEC = 30
 
 KAFKA_BROKER = "192.168.88.4"
 KAFKA_BROKER_PORT = 9092
-KAFKA_TOPIC = "topic2"
+KAFKA_TOPIC = "monitoring"
 
 try:
     from kafka import KafkaProducer
@@ -181,7 +181,7 @@ class KafkaEmitter:
 KAFKA = KafkaEmitter()
 
 # =========================
-# SPOOL REPORTER — snapshot périodique vers topic2
+# SPOOL REPORTER — snapshot périodique vers monitoring
 # =========================
 
 REPORTER_INTERVAL = 5  # secondes entre chaque snapshot
@@ -189,7 +189,7 @@ REPORTER_INTERVAL = 5  # secondes entre chaque snapshot
 class SpoolReporter(threading.Thread):
     """
     Maintient l'état courant du spool et publie un snapshot complet
-    sur topic2 toutes les REPORTER_INTERVAL secondes.
+    sur monitoring toutes les REPORTER_INTERVAL secondes.
     Format : { source, timestamp, inbound_queue, processed_today,
                forwarded_to_nas, failed, current_transfer }
     """

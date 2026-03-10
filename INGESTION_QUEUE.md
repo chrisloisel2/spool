@@ -115,7 +115,7 @@ Le manifeste est un fichier JSON déposé sur le NAS à la fin de chaque upload.
 
 ## Events Kafka associés
 
-Ces events sont émis sur le topic `topic2` en parallèle de la publication RabbitMQ.
+Ces events sont émis sur le topic `monitoring` en parallèle de la publication RabbitMQ.
 
 ### `ingestion_queue / job_published`
 Publié quand le job a été inséré dans la queue avec succès.
