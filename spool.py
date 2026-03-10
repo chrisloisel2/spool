@@ -30,40 +30,46 @@ SPOOL_DIR = "/srv/exoria/spool"
 QUARANTINE_DIR = "/srv/exoria/quarantine"
 DB_PATH = "/srv/exoria/queue.db"
 
-SCAN_INTERVAL = 2
+SCAN_INTERVAL = 1
 
 # Nombre de workers NAS en parallèle.
 # 1 = tout dans le thread principal (pas de threads supplémentaires).
 # >1 = scanner + N workers chacun dans leur propre thread.
-WORKERS = 1
+WORKERS = 4
 
 MAX_RETRIES = 8
-RETRY_BACKOFF = 5
+RETRY_BACKOFF = 2
 
 # NAS (destination finale)
-NAS_HOST = "192.168.88.248"
+NAS_HOST = "192.168.88.82"
 NAS_PORT = 22
-NAS_USER = "EXORIA"
-NAS_PASS = "NasExori@2026!!#"  # mets ton mot de passe ici
+NAS_USER = "exoria"
+NAS_PASS = "Admin123456"
 
-SFTP_BASE_DIR = "/DB-EXORIA/lakehouse"
-LANDING_ZONE = "bronze/landing"
-QUARANTINE_ZONE = "bronze/quarantine"
+SFTP_BASE_DIR = "/data/INBOX"
+LANDING_ZONE = ""
+QUARANTINE_ZONE = "quarantine"
 
 DELETE_LOCAL_AFTER_SUCCESS = True
 COPY_TO_NAS_QUARANTINE = True
-STABLE_FILE_SECONDS = 2
+STABLE_FILE_SECONDS = 0   # fichiers déjà complets à l'arrivée — pas d'attente
+WRITE_MANIFEST = False     # désactivé pour vitesse max — une écriture NAS de moins par fichier
 
 # =========================
 # DURCISSEMENT SSH/SFTP (banner reset)
 # =========================
 
 # Nombre max de connexions NAS simultanées (= WORKERS en pratique, laisser à 1 sauf besoin).
-NAS_MAX_SIMULT_CONNECT = 1
+NAS_MAX_SIMULT_CONNECT = 4
 SSH_TIMEOUT = 20
 BANNER_TIMEOUT = 90
 AUTH_TIMEOUT = 30
 KEEPALIVE_SEC = 30
+
+# Tuning SFTP — buffers larges pour maximiser le débit
+SFTP_WINDOW_SIZE  = 134217728   # 128 MB — fenêtre SSH max
+SFTP_MAX_PACKET   = 65536        # 64 KB — paquet SFTP max
+SFTP_READ_BUFFER  = 4194304      # 4 MB  — buffer lecture locale
 
 # =========================
 # CONFIG KAFKA
@@ -446,8 +452,8 @@ def safe_sender(v):
 
 def sha256(path):
     h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+    with open(path, "rb", buffering=SFTP_READ_BUFFER) as f:
+        for chunk in iter(lambda: f.read(SFTP_READ_BUFFER), b""):
             h.update(chunk)
     return h.hexdigest()
 
@@ -455,6 +461,8 @@ def now_iso():
     return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 def stable(path):
+    if STABLE_FILE_SECONDS == 0:
+        return os.path.exists(path)
     try:
         s1 = os.stat(path)
         time.sleep(STABLE_FILE_SECONDS)
@@ -530,6 +538,8 @@ class NASClient:
 
                     self.ssh = ssh
                     self.sftp = ssh.open_sftp()
+                    self.sftp.get_channel().in_window_size = SFTP_WINDOW_SIZE
+                    self.sftp.get_channel().out_window_size = SFTP_WINDOW_SIZE
 
                     log.info("[NAS] Connexion établie avec succès.")
 
@@ -603,11 +613,13 @@ class NASClient:
 
         size = os.path.getsize(local)
         tmp = remote + ".part"
-        log.info("[NAS] Envoi du fichier '%s' (%d octets) vers NAS...", os.path.basename(local), size)
-        log.debug("[NAS] Chemin local : %s", local)
-        log.debug("[NAS] Chemin distant temporaire : %s", tmp)
-        self.sftp.put(local, tmp)
-        log.info("[NAS] Transfert terminé pour '%s'", os.path.basename(local))
+        log.info("[NAS] Envoi '%s' (%d octets)...", os.path.basename(local), size)
+
+        # putfo avec buffer 4 MB — bien plus rapide que sftp.put (évite les micro-lectures)
+        with open(local, "rb", buffering=SFTP_READ_BUFFER) as fh:
+            self.sftp.putfo(fh, tmp, file_size=size)
+
+        log.info("[NAS] Transfert OK '%s'", os.path.basename(local))
 
         final = remote
         if self.exists(final):
@@ -616,11 +628,10 @@ class NASClient:
             while self.exists(f"{base}.dup{i}"):
                 i += 1
             final = f"{base}.dup{i}"
-            log.warning("[NAS] Fichier '%s' existe déjà, renommé en '%s'", os.path.basename(base), os.path.basename(final))
+            log.warning("[NAS] Doublon '%s' -> '%s'", os.path.basename(base), os.path.basename(final))
 
-        log.debug("[NAS] Renommage : %s -> %s", tmp, final)
         self.sftp.rename(tmp, final)
-        log.info("[NAS] Fichier disponible sur le NAS : %s", final)
+        log.info("[NAS] Disponible : %s", final)
         return final
 
 # =========================
@@ -754,7 +765,8 @@ class Worker(threading.Thread):
         m = f"{today.month:02}"
         d = f"{today.day:02}"
         base = SFTP_BASE_DIR.rstrip("/")
-        directory = posixpath.join(base, LANDING_ZONE, y, m, d, sender)
+        parts = [p for p in [base, LANDING_ZONE, y, m, d, sender] if p]
+        directory = "/".join(parts)
         file = posixpath.join(directory, name)
         manifest = file + ".manifest.json"
         return file, manifest, directory
@@ -809,20 +821,6 @@ class Worker(threading.Thread):
             log.debug("[JOB %s] Intégrité OK.", jid[:8])
 
             remote, manifest_remote, remote_dir = self.build_remote(sender, name)
-            log.debug("[JOB %s] Dossier NAS cible : %s", jid[:8], remote_dir)
-
-            manifest_local = path + ".manifest.json"
-            data = {
-                "job": jid,
-                "sender": sender,
-                "file": name,
-                "sha256": sha,
-                "size_bytes": size,
-                "time": now_iso(),
-            }
-            with open(manifest_local, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            log.debug("[JOB %s] Manifeste créé localement.", jid[:8])
 
             self._nas_call("MKDIR_REMOTE", self.nas.mkdir_p, remote_dir)
 
@@ -833,12 +831,11 @@ class Worker(threading.Thread):
                 "speed_mbps": 0.0,
             })
 
-            log.info("[JOB %s] Envoi du fichier '%s' vers le NAS...", jid[:8], name)
             t_start = time.monotonic()
             final_remote = self._nas_call("UPLOAD_FILE", self.nas.put_atomic, path, remote)
             elapsed = max(time.monotonic() - t_start, 0.001)
             speed = round((size / (1024 * 1024)) / elapsed, 2)
-            log.info("[JOB %s] Fichier '%s' envoyé avec succès -> %s", jid[:8], name, final_remote)
+            log.info("[JOB %s] '%s' -> NAS en %.1fs @ %.1f MB/s", jid[:8], name, elapsed, speed)
 
             REPORTER.set_current_transfer({
                 "from_pc": pc_id,
@@ -847,9 +844,17 @@ class Worker(threading.Thread):
                 "speed_mbps": speed,
             })
 
-            log.debug("[JOB %s] Envoi du manifeste vers le NAS...", jid[:8])
-            final_manifest = self._nas_call("UPLOAD_MANIFEST", self.nas.put_atomic, manifest_local, manifest_remote)
-            log.debug("[JOB %s] Manifeste envoyé -> %s", jid[:8], final_manifest)
+            if WRITE_MANIFEST:
+                manifest_local = path + ".manifest.json"
+                with open(manifest_local, "w", encoding="utf-8") as f:
+                    json.dump({"job": jid, "sender": sender, "file": name,
+                               "sha256": sha, "size_bytes": size, "time": now_iso()},
+                              f, ensure_ascii=False)
+                self._nas_call("UPLOAD_MANIFEST", self.nas.put_atomic, manifest_local, manifest_remote)
+                try:
+                    os.remove(manifest_local)
+                except Exception:
+                    pass
 
             self.conn.execute(
                 "UPDATE jobs SET status='done', updated_at=? WHERE id=?",
@@ -861,20 +866,13 @@ class Worker(threading.Thread):
             REPORTER.inc_forwarded()
             REPORTER.set_current_transfer(None)
 
-            log.info("[JOB %s] Traitement terminé avec succès — fichier disponible sur le NAS : %s", jid[:8], final_remote)
-
-            try:
-                os.remove(manifest_local)
-                log.debug("[JOB %s] Manifeste local supprimé.", jid[:8])
-            except Exception as ce:
-                log.warning("[JOB %s] Impossible de supprimer le manifeste local : %s", jid[:8], ce)
+            log.info("[JOB %s] Done — %s", jid[:8], final_remote)
 
             if DELETE_LOCAL_AFTER_SUCCESS:
                 try:
                     os.remove(path)
-                    log.debug("[JOB %s] Fichier local supprimé après envoi réussi.", jid[:8])
                 except Exception as ce:
-                    log.warning("[JOB %s] Impossible de supprimer le fichier local : %s", jid[:8], ce)
+                    log.warning("[JOB %s] Suppression locale échouée : %s", jid[:8], ce)
 
         except Exception as e:
             err = str(e)
@@ -959,6 +957,19 @@ def main():
     log.info("[App] Mode : %d worker(s)", WORKERS)
 
     conn = db()
+
+    # Reset des jobs figés en 'processing' (crash précédent) → retour en 'queued'
+    stuck = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE status='processing'"
+    ).fetchone()[0]
+    if stuck:
+        conn.execute(
+            "UPDATE jobs SET status='queued', updated_at=? WHERE status='processing'",
+            (now_iso(),),
+        )
+        conn.commit()
+        log.warning("[App] %d job(s) figé(s) en 'processing' remis en file.", stuck)
+
     REPORTER.set_db(conn)
     REPORTER.start()
 
