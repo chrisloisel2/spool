@@ -697,7 +697,7 @@ class Scanner(threading.Thread):
 
             # Session complète ?
             if not self._session_ready(session_dir):
-                log.debug("[Scanner] Session pas encore prête (pas de end_time) : %s", name)
+                log.debug("[Scanner] Session pas encore prête : %s", name)
                 continue
 
             # Déplace le dossier entier dans spool/
