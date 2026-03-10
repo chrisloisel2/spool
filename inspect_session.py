@@ -73,7 +73,7 @@ INGESTION_QUEUE   = os.environ.get("INGESTION_QUEUE",   "ingestion_queue")
 # ── NAS SFTP ──────────────────────────────────────────────────────────────────
 NAS_HOST        = "192.168.88.82"
 NAS_PORT        = 22
-NAS_USER        = "admin1@exoria.local"
+NAS_USER        = "root"
 NAS_PASS        = "Exori@2026!"
 NAS_BASE_DIR    = "/data/INBOX"
 NAS_LANDING     = ""                        # sessions OK
