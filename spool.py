@@ -43,8 +43,8 @@ RETRY_BACKOFF = 2
 # NAS (destination finale)
 NAS_HOST = "192.168.88.82"
 NAS_PORT = 22
-NAS_USER = "exoria"
-NAS_PASS = "Admin123456"
+NAS_USER = "admin1@exoria.local"
+NAS_PASS = "Exori@2026!"
 
 SFTP_BASE_DIR = "/data/INBOX"
 LANDING_ZONE = ""
