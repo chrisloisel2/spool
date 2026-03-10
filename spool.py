@@ -188,30 +188,31 @@ REPORTER_INTERVAL = 5  # secondes entre chaque snapshot
 
 class SpoolReporter(threading.Thread):
     """
-    Maintient l'état courant du spool et publie un snapshot complet
-    sur monitoring toutes les REPORTER_INTERVAL secondes.
-    Format : { source, timestamp, inbound_queue, processed_today,
-               forwarded_to_nas, failed, current_transfer }
+    Publie deux types de messages sur le topic monitoring toutes les REPORTER_INTERVAL secondes :
+
+    1. source="pc"          — un message par pc_id actif (compatibilité SalleReporter back)
+    2. source="spool_status" — snapshot complet du spool pour le front
     """
 
     def __init__(self):
         super().__init__(daemon=True, name="spool-reporter")
         self._lock = threading.Lock()
-        self._inbound_queue = []   # list of dicts {pc_id, session_id, received_at, size_mb}
+        self._inbound_queue = []
         self._processed_today = 0
         self._forwarded_to_nas = 0
         self._failed = 0
-        self._current_transfer = None  # dict or None
+        self._current_transfer = None
+        self._conn = None           # connexion DB injectée par main()
+        self._start_ts = time.time()
 
-    # --- méthodes appelées par Scanner / Worker ---
+    def set_db(self, conn):
+        self._conn = conn
 
     def set_inbound_queue(self, entries: list):
-        """Remplace la file d'attente entière (appelé par Scanner après chaque scan)."""
         with self._lock:
             self._inbound_queue = list(entries)
 
     def set_current_transfer(self, info: dict | None):
-        """Met à jour le transfert en cours (dict ou None)."""
         with self._lock:
             self._current_transfer = info
 
@@ -227,8 +228,6 @@ class SpoolReporter(threading.Thread):
         with self._lock:
             self._failed += 1
 
-    # --- boucle principale ---
-
     def run(self):
         log.info("[Reporter] Démarrage — intervalle=%ds topic=%s", REPORTER_INTERVAL, KAFKA_TOPIC)
         while True:
@@ -238,22 +237,113 @@ class SpoolReporter(threading.Thread):
                 log.warning("[Reporter] Erreur lors de l'émission : %s", e)
             time.sleep(REPORTER_INTERVAL)
 
+    def _db_stats(self) -> dict:
+        """Requête SQLite pour les compteurs globaux et les jobs récents."""
+        if not self._conn:
+            return {}
+        try:
+            # Compteurs par statut
+            rows = self._conn.execute(
+                "SELECT status, COUNT(*) as n, SUM(size_bytes) as total_bytes "
+                "FROM jobs GROUP BY status"
+            ).fetchall()
+            counts = {}
+            sizes  = {}
+            for status, n, total in rows:
+                counts[status] = n
+                sizes[status]  = total or 0
+
+            total_jobs = sum(counts.values())
+            n_done      = counts.get("done", 0)
+            n_failed    = counts.get("failed", 0)
+            n_queued    = counts.get("queued", 0)
+            n_processing = counts.get("processing", 0)
+
+            fail_pct = round(n_failed / total_jobs * 100, 1) if total_jobs else 0.0
+
+            # Taille totale des fichiers en attente (queued)
+            queued_bytes = sizes.get("queued", 0)
+
+            # 5 derniers jobs failed avec leur erreur
+            failed_jobs = self._conn.execute(
+                "SELECT id, sender, original_name, size_bytes, attempts, last_error, updated_at "
+                "FROM jobs WHERE status='failed' ORDER BY updated_at DESC LIMIT 5"
+            ).fetchall()
+            recent_failed = [
+                {
+                    "job_id":    r[0][:8],
+                    "sender":    r[1],
+                    "file":      r[2],
+                    "size_mb":   round((r[3] or 0) / (1024*1024), 2),
+                    "attempts":  r[4],
+                    "error":     (r[5] or "")[:120],
+                    "failed_at": r[6],
+                }
+                for r in failed_jobs
+            ]
+
+            # 5 derniers jobs done
+            done_jobs = self._conn.execute(
+                "SELECT id, sender, original_name, size_bytes, updated_at "
+                "FROM jobs WHERE status='done' ORDER BY updated_at DESC LIMIT 5"
+            ).fetchall()
+            recent_done = [
+                {
+                    "job_id":       r[0][:8],
+                    "sender":       r[1],
+                    "file":         r[2],
+                    "size_mb":      round((r[3] or 0) / (1024*1024), 2),
+                    "completed_at": r[4],
+                }
+                for r in done_jobs
+            ]
+
+            return {
+                "total_jobs":      total_jobs,
+                "queued":          n_queued,
+                "processing":      n_processing,
+                "done":            n_done,
+                "failed":          n_failed,
+                "fail_pct":        fail_pct,
+                "queued_bytes":    queued_bytes,
+                "queued_mb":       round(queued_bytes / (1024*1024), 2),
+                "recent_failed":   recent_failed,
+                "recent_done":     recent_done,
+            }
+        except Exception as e:
+            log.debug("[Reporter] db_stats error: %s", e)
+            return {}
+
+    def _disk_usage(self) -> dict:
+        """Utilisation disque des dossiers spool/inbox/quarantine."""
+        result = {}
+        for label, path in [("inbox", INBOX_DIR), ("spool", SPOOL_DIR), ("quarantine", QUARANTINE_DIR)]:
+            try:
+                total, used, free = shutil.disk_usage(path)
+                result[label] = {
+                    "used_mb":  round(used  / (1024*1024), 1),
+                    "free_mb":  round(free  / (1024*1024), 1),
+                    "total_mb": round(total / (1024*1024), 1),
+                    "used_pct": round(used / total * 100, 1) if total else 0.0,
+                }
+            except Exception:
+                result[label] = None
+        return result
+
     def _emit(self):
         with self._lock:
-            msg = {
-                "source": "spool",
-                "timestamp": now_iso(),
-                "inbound_queue": list(self._inbound_queue),
-                "processed_today": self._processed_today,
-                "forwarded_to_nas": self._forwarded_to_nas,
-                "failed": self._failed,
-                "current_transfer": self._current_transfer,
-            }
+            queue    = list(self._inbound_queue)
+            transfer = self._current_transfer
+            failed   = self._failed
+            processed = self._processed_today
+            forwarded = self._forwarded_to_nas
 
-        log.debug("[Reporter] Snapshot : queue=%d processed=%d forwarded=%d failed=%d transfer=%s",
-                  len(msg["inbound_queue"]), msg["processed_today"],
-                  msg["forwarded_to_nas"], msg["failed"],
-                  msg["current_transfer"])
+        db    = self._db_stats()
+        disk  = self._disk_usage()
+        uptime_s = int(time.time() - self._start_ts)
+
+        log.debug("[Reporter] Snapshot : queue=%d transfer=%s failed=%d",
+                  len(queue), transfer, failed)
 
         if not HAS_KAFKA:
             return
@@ -262,7 +352,80 @@ class SpoolReporter(threading.Thread):
             KAFKA._ensure()
             if not KAFKA._producer:
                 return
-            KAFKA._producer.send(KAFKA_TOPIC, msg)
+
+            # ── 1. Messages source="pc" (un par pc_id actif) ─────────────────
+            pc_ids_seen  = set()
+            entries_by_pc = {}
+            for entry in queue:
+                pc_id = int(entry.get("pc_id", 0))
+                if pc_id:
+                    entries_by_pc.setdefault(pc_id, []).append(entry)
+                    pc_ids_seen.add(pc_id)
+            if transfer and transfer.get("from_pc"):
+                pc_ids_seen.add(int(transfer["from_pc"]))
+
+            for pc_id in pc_ids_seen:
+                pc_queue = entries_by_pc.get(pc_id, [])
+                is_xfer  = bool(transfer and int(transfer.get("from_pc", 0)) == pc_id)
+                KAFKA._producer.send(KAFKA_TOPIC, {
+                    "source":            "pc",
+                    "pc_id":             pc_id,
+                    "hostname":          f"PC-{pc_id:05d}",
+                    "operator_username": None,
+                    "is_recording":      False,
+                    "has_alert":         failed > 0,
+                    "sqlite_queue":      len(pc_queue),
+                    "last_send":         pc_queue[0].get("received_at") if pc_queue else None,
+                    "disconnected":      False,
+                    "current_transfer":  transfer if is_xfer else None,
+                })
+
+            # ── 2. Snapshot spool complet ─────────────────────────────────────
+            KAFKA._producer.send(KAFKA_TOPIC, {
+                "source":    "spool_status",
+                "ts":        time.time(),
+                "uptime_s":  uptime_s,
+
+                # File d'attente
+                "queue": {
+                    "count":      db.get("queued", len(queue)),
+                    "total_mb":   db.get("queued_mb", 0.0),
+                    "entries":    queue,          # liste détaillée {pc_id, session_id, received_at, size_mb}
+                },
+
+                # Transfert en cours
+                "current_transfer": transfer,     # None ou {from_pc, session_id, progress_pct, speed_mbps}
+
+                # Compteurs de session (session courante depuis démarrage)
+                "stats": {
+                    "processed_today":  processed,
+                    "forwarded_to_nas": forwarded,
+                    "failed_session":   failed,
+                    # Depuis la DB (all-time)
+                    "total_jobs":       db.get("total_jobs", 0),
+                    "done":             db.get("done", 0),
+                    "failed_total":     db.get("failed", 0),
+                    "processing":       db.get("processing", 0),
+                    "fail_pct":         db.get("fail_pct", 0.0),   # % échec sur total
+                },
+
+                # Disque
+                "disk": disk,
+
+                # Historique jobs récents
+                "recent_failed": db.get("recent_failed", []),
+                "recent_done":   db.get("recent_done", []),
+
+                # Config courante
+                "config": {
+                    "workers":      WORKERS,
+                    "max_retries":  MAX_RETRIES,
+                    "scan_interval_s": SCAN_INTERVAL,
+                    "nas_host":     NAS_HOST,
+                    "nas_port":     NAS_PORT,
+                },
+            })
+
             KAFKA._producer.flush(timeout=5)
         except Exception as e:
             log.warning("[Reporter] Kafka send failed : %s", e)
@@ -795,8 +958,9 @@ def main():
     log.info("[App] Démarrage — inbox=%s  spool=%s  quarantine=%s  db=%s", INBOX_DIR, SPOOL_DIR, QUARANTINE_DIR, DB_PATH)
     log.info("[App] Mode : %d worker(s)", WORKERS)
 
-    REPORTER.start()
     conn = db()
+    REPORTER.set_db(conn)
+    REPORTER.start()
 
     if WORKERS == 1:
         log.info("[App] Démarrage en mode mono-thread.")
