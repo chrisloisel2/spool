@@ -86,7 +86,7 @@ KEEPALIVE_SEC   = 30
 
 # ── Kafka ─────────────────────────────────────────────────────────────────────
 KAFKA_BROKER    = os.environ.get("KAFKA_BROKER", "192.168.88.4:9092")
-KAFKA_TOPIC     = "topic2"
+KAFKA_TOPIC     = "monitoring"
 
 # ── Session locale ────────────────────────────────────────────────────────────
 # Dossier racine où sont stockées les sessions sur cette machine.
