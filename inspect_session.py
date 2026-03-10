@@ -75,9 +75,9 @@ NAS_HOST        = "192.168.88.82"
 NAS_PORT        = 22
 NAS_USER        = "root"
 NAS_PASS        = "Exori@2026!"
-NAS_BASE_DIR    = "/data/INBOX"
-NAS_LANDING     = ""                        # sessions OK
-NAS_QUARANTINE  = "quarantine"              # sessions KO
+NAS_BASE_DIR    = "/data/INBOX/bronze"
+NAS_LANDING     = ""                        # sessions OK → bronze
+NAS_QUARANTINE  = "/data/INBOX/quarantine"  # sessions KO
 
 SSH_TIMEOUT     = 20
 BANNER_TIMEOUT  = 90

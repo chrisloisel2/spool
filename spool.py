@@ -46,9 +46,9 @@ NAS_PORT = 22
 NAS_USER = "root"
 NAS_PASS = "Exori@2026!"
 
-SFTP_BASE_DIR = "/data/INBOX"
+SFTP_BASE_DIR = "/data/INBOX/bronze"
 LANDING_ZONE = ""
-QUARANTINE_ZONE = "quarantine"
+QUARANTINE_ZONE = "/data/INBOX/quarantine"
 
 DELETE_LOCAL_AFTER_SUCCESS = True
 COPY_TO_NAS_QUARANTINE = True
