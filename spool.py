@@ -106,11 +106,10 @@ PRAGMA synchronous=NORMAL;
 
 CREATE TABLE IF NOT EXISTS jobs (
  id TEXT PRIMARY KEY,
- local_path TEXT,
- sender TEXT,
- original_name TEXT,
+ session_dir TEXT,          -- chemin absolu du dossier session dans spool/
+ session_id TEXT,           -- ex: session_20260308_161838
  size_bytes INTEGER,
- sha256 TEXT,
+ file_count INTEGER,
  status TEXT,
  attempts INTEGER,
  last_error TEXT,
@@ -121,6 +120,8 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at);
 """
+
+SESSION_RE = re.compile(r"^session_\d{8}_\d{6}$")
 
 def db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -652,61 +653,96 @@ class Scanner(threading.Thread):
                 log.error("[Scanner] Erreur inattendue : %s\n%s", e, traceback.format_exc())
             time.sleep(SCAN_INTERVAL)
 
-    def scan(self):
-        for root, _dirs, files in os.walk(INBOX_DIR):
-            rel = os.path.relpath(root, INBOX_DIR)
-            sender = "unknown" if rel == "." else safe_sender(rel.split(os.sep)[0])
+    def _session_ready(self, session_dir: str) -> bool:
+        """
+        Une session est prête quand metadata.json existe et contient 'end_time'.
+        C'est le marqueur de fin posé par le processus d'enregistrement.
+        """
+        meta = os.path.join(session_dir, "metadata.json")
+        if not os.path.exists(meta):
+            return False
+        try:
+            with open(meta, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return bool(data.get("end_time"))
+        except Exception:
+            return False
 
+    def _dir_size_and_count(self, path: str):
+        total_bytes = 0
+        count = 0
+        for root, _dirs, files in os.walk(path):
             for f in files:
-                src = os.path.join(root, f)
-                if f.endswith(".part") or f.endswith(".tmp"):
-                    log.debug("[Scanner] Fichier temporaire ignoré : %s", src)
-                    continue
-
-                log.debug("[Scanner] Fichier détecté — expéditeur=%s fichier=%s", sender, f)
-
-                if not stable(src):
-                    log.debug("[Scanner] Fichier pas encore stable (écriture en cours) : %s", src)
-                    continue
-
                 try:
-                    jid = uuid.uuid4().hex
-                    dst = os.path.join(SPOOL_DIR, jid + "__" + f)
+                    total_bytes += os.path.getsize(os.path.join(root, f))
+                    count += 1
+                except Exception:
+                    pass
+        return total_bytes, count
 
-                    os.replace(src, dst)
-                    size = os.path.getsize(dst)
-                    log.debug("[Scanner] Calcul SHA256 pour '%s'...", f)
-                    h = sha256(dst)
+    def scan(self):
+        # Cherche les sous-dossiers directs de inbox/ qui matchent session_YYYYMMDD_HHMMSS
+        try:
+            entries = os.listdir(INBOX_DIR)
+        except Exception as e:
+            log.error("[Scanner] Impossible de lire inbox : %s", e)
+            return
 
-                    self.conn.execute(
-                        "INSERT INTO jobs VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                        (jid, dst, sender, f, size, h, "queued", 0, "", now_iso(), now_iso()),
-                    )
-                    self.conn.commit()
+        for name in entries:
+            if not SESSION_RE.match(name):
+                continue
 
-                    log.info("[Scanner] Nouveau fichier mis en file : '%s' (%d octets) de '%s' [job=%s]", f, size, sender, jid[:8])
+            session_dir = os.path.join(INBOX_DIR, name)
+            if not os.path.isdir(session_dir):
+                continue
 
-                except Exception as e:
-                    log.error("[Scanner] Impossible d'enregistrer le fichier '%s' : %s\n%s", src, e, traceback.format_exc())
+            # Déjà en base ?
+            existing = self.conn.execute(
+                "SELECT id FROM jobs WHERE session_id=?", (name,)
+            ).fetchone()
+            if existing:
+                continue
 
-        # Mise à jour de la file d'attente dans le reporter
+            # Session complète ?
+            if not self._session_ready(session_dir):
+                log.debug("[Scanner] Session pas encore prête (pas de end_time) : %s", name)
+                continue
+
+            # Déplace le dossier entier dans spool/
+            try:
+                jid = uuid.uuid4().hex
+                dst = os.path.join(SPOOL_DIR, name)
+
+                shutil.move(session_dir, dst)
+                size_bytes, file_count = self._dir_size_and_count(dst)
+
+                self.conn.execute(
+                    "INSERT INTO jobs(id,session_dir,session_id,size_bytes,file_count,status,attempts,last_error,created_at,updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (jid, dst, name, size_bytes, file_count, "queued", 0, "", now_iso(), now_iso()),
+                )
+                self.conn.commit()
+
+                log.info("[Scanner] Session mise en file : %s (%d fichiers, %.1f MB) [job=%s]",
+                         name, file_count, size_bytes / (1024*1024), jid[:8])
+
+            except Exception as e:
+                log.error("[Scanner] Impossible d'enregistrer la session '%s' : %s\n%s", name, e, traceback.format_exc())
+
+        # Mise à jour reporter
         try:
             rows = self.conn.execute(
-                "SELECT id, sender, size_bytes, created_at FROM jobs WHERE status='queued' ORDER BY created_at ASC"
+                "SELECT id, session_id, size_bytes, file_count, created_at FROM jobs WHERE status='queued' ORDER BY created_at ASC"
             ).fetchall()
-            queue = []
-            for row in rows:
-                # pc_id : on essaie d'extraire un entier depuis sender, sinon 0
-                try:
-                    pc_id = int(row[1])
-                except (ValueError, TypeError):
-                    pc_id = 0
-                queue.append({
-                    "pc_id": pc_id,
-                    "session_id": row[0][:8],
-                    "received_at": row[3],
-                    "size_mb": round(row[2] / (1024 * 1024), 2) if row[2] else 0.0,
-                })
+            queue = [
+                {
+                    "session_id": r[1],
+                    "size_mb": round((r[2] or 0) / (1024*1024), 2),
+                    "file_count": r[3],
+                    "received_at": r[4],
+                }
+                for r in rows
+            ]
             REPORTER.set_inbound_queue(queue)
         except Exception as e:
             log.debug("[Scanner] Reporter queue update failed: %s", e)
@@ -724,34 +760,30 @@ class Worker(threading.Thread):
 
     def get_job(self):
         row = self.conn.execute(
-            "SELECT * FROM jobs WHERE status='queued' ORDER BY created_at ASC LIMIT 1"
+            "SELECT id,session_dir,session_id,size_bytes,file_count,attempts "
+            "FROM jobs WHERE status='queued' ORDER BY created_at ASC LIMIT 1"
         ).fetchone()
-
         if not row:
             return None
 
         jid = row[0]
-        updated = now_iso()
         self.conn.execute(
             "UPDATE jobs SET status='processing', updated_at=? WHERE id=? AND status='queued'",
-            (updated, jid),
+            (now_iso(), jid),
         )
         self.conn.commit()
 
-        row2 = self.conn.execute(
-            "SELECT * FROM jobs WHERE id=? AND status='processing'",
-            (jid,),
-        ).fetchone()
-
-        if not row2:
+        # Vérifie qu'on a bien pris le lock
+        if not self.conn.execute(
+            "SELECT 1 FROM jobs WHERE id=? AND status='processing'", (jid,)
+        ).fetchone():
             return None
 
         log.debug("[Worker-%d] Job %s pris en charge.", self.idx, jid[:8])
-        return row2
+        return row  # (id, session_dir, session_id, size_bytes, file_count, attempts)
 
     def run(self):
         log.info("[Worker-%d] Démarrage.", self.idx)
-
         while True:
             job = self.get_job()
             if not job:
@@ -759,25 +791,13 @@ class Worker(threading.Thread):
                 continue
             self.process(job)
 
-    def build_remote(self, sender, name):
-        today = dt.datetime.utcnow()
-        y = f"{today.year:04}"
-        m = f"{today.month:02}"
-        d = f"{today.day:02}"
-        base = SFTP_BASE_DIR.rstrip("/")
-        parts = [p for p in [base, LANDING_ZONE, y, m, d, sender] if p]
-        directory = "/".join(parts)
-        file = posixpath.join(directory, name)
-        manifest = file + ".manifest.json"
-        return file, manifest, directory
-
     def _nas_call(self, op: str, fn, *args, **kwargs):
         for attempt in range(1, 6):
             try:
                 self.nas.ensure()
                 return fn(*args, **kwargs)
             except (paramiko.SSHException, ConnectionResetError, EOFError, OSError) as e:
-                log.warning("[NAS] Opération '%s' échouée (tentative %d/5) : %s", op, attempt, e)
+                log.warning("[NAS] '%s' échoué tentative %d/5 : %s", op, attempt, e)
                 try:
                     self.nas.close()
                 except Exception:
@@ -785,76 +805,71 @@ class Worker(threading.Thread):
                 time.sleep(min(30, attempt * 3.0) + random.random())
         raise RuntimeError(f"NAS operation failed op={op}")
 
+    def _collect_files(self, session_dir: str):
+        """Retourne la liste de (local_abs, rel_posix) pour tous les fichiers de la session."""
+        files = []
+        for root, _, fnames in os.walk(session_dir):
+            for fname in fnames:
+                local_abs = os.path.join(root, fname)
+                rel = os.path.relpath(local_abs, session_dir)
+                rel_posix = rel.replace(os.sep, "/")
+                files.append((local_abs, rel_posix))
+        return sorted(files, key=lambda x: x[1])
+
     def process(self, job):
-        jid = job[0]
-        path = job[1]
-        sender = job[2]
-        name = job[3]
-        size = job[4]
-        sha = job[5]
-        attempts_prev = job[7]
+        jid, session_dir, session_id, size_bytes, file_count, attempts_prev = job
         attempts = attempts_prev + 1
 
-        log.info("[JOB %s] Traitement démarré — fichier='%s' expéditeur='%s' tentative=%d", jid[:8], name, sender, attempts)
-
-        # pc_id : extrait depuis sender si numérique
-        try:
-            pc_id = int(sender)
-        except (ValueError, TypeError):
-            pc_id = 0
+        log.info("[JOB %s] Session '%s' — %d fichiers, %.1f MB, tentative %d",
+                 jid[:8], session_id, file_count, (size_bytes or 0) / (1024*1024), attempts)
 
         REPORTER.set_current_transfer({
-            "from_pc": pc_id,
-            "session_id": jid[:8],
+            "session_id": session_id,
             "progress_pct": 0,
             "speed_mbps": 0.0,
+            "file_count": file_count,
         })
 
         try:
-            if not os.path.exists(path):
-                raise Exception("missing file")
+            if not os.path.isdir(session_dir):
+                raise Exception(f"dossier session introuvable : {session_dir}")
 
-            log.debug("[JOB %s] Vérification intégrité SHA256...", jid[:8])
-            h2 = sha256(path)
-            if h2 != sha:
-                raise Exception("hash mismatch")
-            log.debug("[JOB %s] Intégrité OK.", jid[:8])
+            files = self._collect_files(session_dir)
+            if not files:
+                raise Exception("session vide — aucun fichier trouvé")
 
-            remote, manifest_remote, remote_dir = self.build_remote(sender, name)
-
-            self._nas_call("MKDIR_REMOTE", self.nas.mkdir_p, remote_dir)
-
-            REPORTER.set_current_transfer({
-                "from_pc": pc_id,
-                "session_id": jid[:8],
-                "progress_pct": 10,
-                "speed_mbps": 0.0,
-            })
+            # Dossier NAS cible : /data/INBOX/<session_id>/
+            remote_base = posixpath.join(SFTP_BASE_DIR.rstrip("/"), session_id)
+            self._nas_call("MKDIR_SESSION", self.nas.mkdir_p, remote_base)
 
             t_start = time.monotonic()
-            final_remote = self._nas_call("UPLOAD_FILE", self.nas.put_atomic, path, remote)
+            bytes_sent = 0
+            total_bytes = size_bytes or 1
+
+            for i, (local_abs, rel_posix) in enumerate(files):
+                remote_path = posixpath.join(remote_base, rel_posix)
+                fsize = os.path.getsize(local_abs)
+
+                self._nas_call(f"UPLOAD:{rel_posix}", self.nas.put_atomic, local_abs, remote_path)
+
+                bytes_sent += fsize
+                pct = int(bytes_sent / total_bytes * 90)
+                elapsed = max(time.monotonic() - t_start, 0.001)
+                speed = round(bytes_sent / (1024*1024) / elapsed, 2)
+
+                REPORTER.set_current_transfer({
+                    "session_id": session_id,
+                    "progress_pct": pct,
+                    "speed_mbps": speed,
+                    "files_done": i + 1,
+                    "file_count": len(files),
+                })
+
+                log.debug("[JOB %s] %d/%d '%s' @ %.1f MB/s", jid[:8], i+1, len(files), rel_posix, speed)
+
             elapsed = max(time.monotonic() - t_start, 0.001)
-            speed = round((size / (1024 * 1024)) / elapsed, 2)
-            log.info("[JOB %s] '%s' -> NAS en %.1fs @ %.1f MB/s", jid[:8], name, elapsed, speed)
-
-            REPORTER.set_current_transfer({
-                "from_pc": pc_id,
-                "session_id": jid[:8],
-                "progress_pct": 90,
-                "speed_mbps": speed,
-            })
-
-            if WRITE_MANIFEST:
-                manifest_local = path + ".manifest.json"
-                with open(manifest_local, "w", encoding="utf-8") as f:
-                    json.dump({"job": jid, "sender": sender, "file": name,
-                               "sha256": sha, "size_bytes": size, "time": now_iso()},
-                              f, ensure_ascii=False)
-                self._nas_call("UPLOAD_MANIFEST", self.nas.put_atomic, manifest_local, manifest_remote)
-                try:
-                    os.remove(manifest_local)
-                except Exception:
-                    pass
+            speed = round((size_bytes or 0) / (1024*1024) / elapsed, 2)
+            log.info("[JOB %s] Session '%s' envoyée en %.1fs @ %.1f MB/s", jid[:8], session_id, elapsed, speed)
 
             self.conn.execute(
                 "UPDATE jobs SET status='done', updated_at=? WHERE id=?",
@@ -866,11 +881,10 @@ class Worker(threading.Thread):
             REPORTER.inc_forwarded()
             REPORTER.set_current_transfer(None)
 
-            log.info("[JOB %s] Done — %s", jid[:8], final_remote)
-
             if DELETE_LOCAL_AFTER_SUCCESS:
                 try:
-                    os.remove(path)
+                    shutil.rmtree(session_dir)
+                    log.debug("[JOB %s] Dossier local supprimé.", jid[:8])
                 except Exception as ce:
                     log.warning("[JOB %s] Suppression locale échouée : %s", jid[:8], ce)
 
@@ -891,18 +905,21 @@ class Worker(threading.Thread):
 
             try:
                 os.makedirs(QUARANTINE_DIR, exist_ok=True)
-                q = os.path.join(QUARANTINE_DIR, os.path.basename(path))
+                q = os.path.join(QUARANTINE_DIR, session_id)
 
-                if os.path.exists(path):
-                    shutil.move(path, q)
-                    log.warning("[JOB %s] Fichier '%s' mis en quarantaine locale : %s", jid[:8], name, q)
+                if os.path.isdir(session_dir):
+                    shutil.move(session_dir, q)
+                    log.warning("[JOB %s] Session '%s' mise en quarantaine locale : %s", jid[:8], session_id, q)
 
-                if COPY_TO_NAS_QUARANTINE and os.path.exists(q):
-                    base = SFTP_BASE_DIR.rstrip("/")
-                    remote_q = posixpath.join(base, QUARANTINE_ZONE, sender, os.path.basename(q))
-                    log.warning("[JOB %s] Envoi en quarantaine NAS : %s", jid[:8], remote_q)
-                    final_q = self._nas_call("UPLOAD_QUARANTINE", self.nas.put_atomic, q, remote_q)
-                    log.warning("[JOB %s] Fichier en quarantaine NAS : %s", jid[:8], final_q)
+                if COPY_TO_NAS_QUARANTINE and os.path.isdir(q):
+                    remote_q_base = posixpath.join(SFTP_BASE_DIR.rstrip("/"), QUARANTINE_ZONE, session_id)
+                    log.warning("[JOB %s] Envoi quarantaine NAS : %s", jid[:8], remote_q_base)
+                    for local_abs, rel_posix in self._collect_files(q):
+                        remote_path = posixpath.join(remote_q_base, rel_posix)
+                        try:
+                            self._nas_call(f"QUARANTINE:{rel_posix}", self.nas.put_atomic, local_abs, remote_path)
+                        except Exception:
+                            pass
 
             except Exception as e2:
                 log.error("[JOB %s] Echec mise en quarantaine : %s\n%s", jid[:8], e2, traceback.format_exc())
