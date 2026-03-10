@@ -655,18 +655,10 @@ class Scanner(threading.Thread):
 
     def _session_ready(self, session_dir: str) -> bool:
         """
-        Une session est prête quand metadata.json existe et contient 'end_time'.
-        C'est le marqueur de fin posé par le processus d'enregistrement.
+        Une session est prête dès que metadata.json existe (même sans end_time).
+        Les sessions crashées ont des données utiles et doivent être transférées.
         """
-        meta = os.path.join(session_dir, "metadata.json")
-        if not os.path.exists(meta):
-            return False
-        try:
-            with open(meta, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return bool(data.get("end_time"))
-        except Exception:
-            return False
+        return os.path.exists(os.path.join(session_dir, "metadata.json"))
 
     def _dir_size_and_count(self, path: str):
         total_bytes = 0
