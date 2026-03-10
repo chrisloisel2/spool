@@ -654,11 +654,7 @@ class Scanner(threading.Thread):
             time.sleep(SCAN_INTERVAL)
 
     def _session_ready(self, session_dir: str) -> bool:
-        """
-        Une session est prête dès que metadata.json existe (même sans end_time).
-        Les sessions crashées ont des données utiles et doivent être transférées.
-        """
-        return os.path.exists(os.path.join(session_dir, "metadata.json"))
+        return True
 
     def _dir_size_and_count(self, path: str):
         total_bytes = 0
