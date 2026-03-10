@@ -184,7 +184,7 @@ KAFKA = KafkaEmitter()
 # SPOOL REPORTER — snapshot périodique vers monitoring
 # =========================
 
-REPORTER_INTERVAL = 5  # secondes entre chaque snapshot
+REPORTER_INTERVAL = 1  # secondes entre chaque snapshot
 
 class SpoolReporter(threading.Thread):
     """
