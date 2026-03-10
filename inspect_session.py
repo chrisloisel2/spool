@@ -20,7 +20,6 @@ Usage :
 """
 
 import os
-import re
 import sys
 import csv
 import json
@@ -72,13 +71,13 @@ SCENARIOS_QUEUE   = os.environ.get("SCENARIOS_QUEUE",   "scenarios_queue")
 INGESTION_QUEUE   = os.environ.get("INGESTION_QUEUE",   "ingestion_queue")
 
 # ── NAS SFTP ──────────────────────────────────────────────────────────────────
-NAS_HOST        = os.environ.get("NAS_HOST",   "192.168.88.248")
-NAS_PORT        = int(os.environ.get("NAS_PORT",  "22"))
-NAS_USER        = os.environ.get("NAS_USER",   "EXORIA")
-NAS_PASS        = os.environ.get("NAS_PASS",   "NasExori@2026!!#")
-NAS_BASE_DIR    = "/DB-EXORIA/lakehouse"
-NAS_LANDING     = "bronze/landing"          # sessions OK
-NAS_QUARANTINE  = "bronze/quarantine"       # sessions KO
+NAS_HOST        = "192.168.88.82"
+NAS_PORT        = 22
+NAS_USER        = "exoria"
+NAS_PASS        = "Admin123456"
+NAS_BASE_DIR    = "/data/INBOX"
+NAS_LANDING     = ""                        # sessions OK
+NAS_QUARANTINE  = "quarantine"              # sessions KO
 
 SSH_TIMEOUT     = 20
 BANNER_TIMEOUT  = 90
@@ -565,19 +564,14 @@ class SessionInspector:
 
 def build_nas_path(session_id: str, rel: str, zone: str = NAS_LANDING) -> str:
     """
-    Construit le chemin NAS :
-      /DB-EXORIA/lakehouse/bronze/landing/2026/03/08/<session_id>/<rel>
+    Construit le chemin sur fs-exoria :
+      /data/INBOX/<session_id>/<rel>
+      /data/INBOX/quarantine/<session_id>/<rel>  (si zone = quarantine)
     """
-    # extrait la date depuis session_id (session_YYYYMMDD_HHMMSS)
-    m = re.search(r"(\d{4})(\d{2})(\d{2})", session_id)
-    if m:
-        y, mo, d = m.group(1), m.group(2), m.group(3)
-    else:
-        now = dt.datetime.utcnow()
-        y, mo, d = f"{now.year:04}", f"{now.month:02}", f"{now.day:02}"
-
     base = NAS_BASE_DIR.rstrip("/")
-    return posixpath.join(base, zone, y, mo, d, session_id, rel)
+    if zone:
+        return posixpath.join(base, zone, session_id, rel)
+    return posixpath.join(base, session_id, rel)
 
 
 def upload_session(report: Dict[str, Any], zone: str = NAS_LANDING) -> Tuple[Dict[str, Any], str]:
