@@ -1,0 +1,358 @@
+#!/usr/bin/env bash
+# run.sh — Lance spool comme service permanent, puis affiche le TUI live.
+# Usage : ./run.sh [stop|restart|logs|status]
+set -euo pipefail
+
+# ── CONFIG ────────────────────────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SPOOL_PY="${SCRIPT_DIR}/spool.py"
+PYTHON="$(command -v python3)"
+LOG_FILE="/srv/exoria/spool.log"
+PID_FILE="/tmp/spool_daemon.pid"
+
+# Couleurs
+R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; C='\033[0;36m'; B='\033[1m'; N='\033[0m'
+
+banner() {
+    echo -e "${C}${B}"
+    echo "  ╔══════════════════════════════════════╗"
+    echo "  ║       ⚡  SPOOL TURBO  — run.sh      ║"
+    echo "  ╚══════════════════════════════════════╝"
+    echo -e "${N}"
+}
+
+info()  { echo -e "  ${G}▶${N} $*"; }
+warn()  { echo -e "  ${Y}⚠${N}  $*"; }
+err()   { echo -e "  ${R}✗${N}  $*" >&2; }
+ok()    { echo -e "  ${G}✓${N}  $*"; }
+
+# ── HELPERS ───────────────────────────────────────────────────────────────────
+
+is_running() {
+    [[ -f "$PID_FILE" ]] || return 1
+    local pid
+    pid=$(cat "$PID_FILE" 2>/dev/null) || return 1
+    kill -0 "$pid" 2>/dev/null
+}
+
+start_daemon() {
+    if is_running; then
+        ok "spool est déjà en cours (pid=$(cat "$PID_FILE"))"
+        return 0
+    fi
+
+    # Crée les répertoires nécessaires
+    mkdir -p /srv/exoria/inbox /srv/exoria/spool /srv/exoria/quarantine
+    mkdir -p "$(dirname "$LOG_FILE")"
+    touch "$LOG_FILE"
+
+    info "Démarrage du daemon spool..."
+
+    # Lance en arrière-plan, stdout/stderr → log
+    nohup "$PYTHON" -u "$SPOOL_PY" >> "$LOG_FILE" 2>&1 &
+    local pid=$!
+    echo "$pid" > "$PID_FILE"
+
+    # Vérifie qu'il a bien démarré (attend 2s)
+    sleep 2
+    if kill -0 "$pid" 2>/dev/null; then
+        ok "Daemon démarré  (pid=$pid)"
+        ok "Logs : $LOG_FILE"
+    else
+        err "Le daemon a planté au démarrage. Consulte les logs :"
+        tail -20 "$LOG_FILE" | sed 's/^/    /'
+        exit 1
+    fi
+}
+
+stop_daemon() {
+    if ! is_running; then
+        warn "spool n'est pas en cours d'exécution."
+        return 0
+    fi
+    local pid
+    pid=$(cat "$PID_FILE")
+    info "Arrêt du daemon (pid=$pid)..."
+    kill "$pid" 2>/dev/null || true
+
+    # Attend jusqu'à 10s
+    local i=0
+    while kill -0 "$pid" 2>/dev/null && [[ $i -lt 10 ]]; do
+        sleep 1; (( i++ ))
+    done
+
+    if kill -0 "$pid" 2>/dev/null; then
+        warn "Le process résiste, envoi de SIGKILL..."
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+
+    rm -f "$PID_FILE"
+    ok "Daemon arrêté."
+}
+
+show_status() {
+    echo ""
+    if is_running; then
+        local pid; pid=$(cat "$PID_FILE")
+        echo -e "  Statut  : ${G}${B}EN COURS${N}  (pid=$pid)"
+    else
+        echo -e "  Statut  : ${R}${B}ARRÊTÉ${N}"
+    fi
+    echo -e "  Log     : $LOG_FILE"
+    echo -e "  Python  : $PYTHON"
+    echo -e "  Script  : $SPOOL_PY"
+    echo ""
+}
+
+attach_tui() {
+    info "Lancement du TUI live... (q pour quitter le visuel, le daemon continue)"
+    echo ""
+    sleep 0.5
+    "$PYTHON" - << 'PYEOF'
+import sys, os, time, curses, collections, sqlite3, datetime as dt
+
+LOG_FILE  = "/srv/exoria/spool.log"
+DB_PATH   = "/srv/exoria/queue.db"
+PID_FILE  = "/tmp/spool_daemon.pid"
+WORKERS   = 16
+NAS_HOST  = "192.168.88.82"
+
+def _fmt_size(b):
+    if b >= 1<<30: return f"{b/(1<<30):.1f} GB"
+    if b >= 1<<20: return f"{b/(1<<20):.1f} MB"
+    if b >= 1<<10: return f"{b/(1<<10):.0f} KB"
+    return f"{b} B"
+
+def _fmt_eta(remaining, speed_bps):
+    if speed_bps <= 0 or remaining <= 0: return "--:--"
+    secs = int(remaining / speed_bps)
+    h, r = divmod(secs, 3600); m, s = divmod(r, 60)
+    if h:  return f"{h}h{m:02d}m"
+    if m:  return f"{m}m{s:02d}s"
+    return f"{s}s"
+
+def _bar(pct, width=20, filled="█", empty="░"):
+    n = max(0, min(int(pct / 100 * width), width))
+    return filled * n + empty * (width - n)
+
+def is_running():
+    try:
+        pid = int(open(PID_FILE).read().strip())
+        os.kill(pid, 0)
+        return pid
+    except Exception:
+        return None
+
+def db_stats():
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=2)
+        rows = conn.execute(
+            "SELECT status, COUNT(*), SUM(size_bytes) FROM jobs GROUP BY status"
+        ).fetchall()
+        counts, sizes = {}, {}
+        for st, n, b in rows:
+            counts[st] = n; sizes[st] = b or 0
+
+        # bytes restants (queued + processing)
+        remaining_b = sizes.get("queued", 0) + sizes.get("processing", 0)
+        total_b = sum(sizes.values())
+        sent_b  = sizes.get("done", 0)
+
+        # vitesse sur les 30 dernières secondes depuis le log
+        speed_mbps = 0.0
+        try:
+            with open(LOG_FILE, "rb") as f:
+                f.seek(max(0, os.path.getsize(LOG_FILE) - 8000))
+                tail = f.read().decode("utf-8", errors="replace").splitlines()
+            speeds = []
+            for line in reversed(tail):
+                if "@ " in line and "MB/s" in line:
+                    try:
+                        spd = float(line.split("@ ")[1].split(" MB/s")[0])
+                        speeds.append(spd)
+                        if len(speeds) >= 5: break
+                    except Exception: pass
+            if speeds:
+                speed_mbps = sum(speeds) / len(speeds)
+        except Exception: pass
+
+        conn.close()
+        return {
+            "queued":    counts.get("queued", 0),
+            "processing":counts.get("processing", 0),
+            "done":      counts.get("done", 0),
+            "failed":    counts.get("failed", 0),
+            "total_b":   total_b,
+            "sent_b":    sent_b,
+            "remaining_b": remaining_b,
+            "speed_mbps": speed_mbps,
+        }
+    except Exception:
+        return {"queued":0,"processing":0,"done":0,"failed":0,
+                "total_b":0,"sent_b":0,"remaining_b":0,"speed_mbps":0.0}
+
+def read_log_tail(n=30):
+    try:
+        size = os.path.getsize(LOG_FILE)
+        with open(LOG_FILE, "rb") as f:
+            f.seek(max(0, size - 12000))
+            raw = f.read().decode("utf-8", errors="replace")
+        lines = [l for l in raw.splitlines() if l.strip()]
+        return lines[-n:]
+    except Exception:
+        return []
+
+def main(stdscr):
+    curses.curs_set(0)
+    stdscr.nodelay(True)
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_CYAN,    -1)
+    curses.init_pair(2, curses.COLOR_GREEN,   -1)
+    curses.init_pair(3, curses.COLOR_YELLOW,  -1)
+    curses.init_pair(4, curses.COLOR_RED,     -1)
+    curses.init_pair(5, curses.COLOR_MAGENTA, -1)
+    curses.init_pair(6, curses.COLOR_WHITE,   -1)
+    curses.init_pair(7, curses.COLOR_BLACK,   curses.COLOR_CYAN)
+    curses.init_pair(8, curses.COLOR_BLACK,   curses.COLOR_GREEN)
+
+    C_TITLE = curses.color_pair(1) | curses.A_BOLD
+    C_OK    = curses.color_pair(2)
+    C_WARN  = curses.color_pair(3)
+    C_ERR   = curses.color_pair(4)
+    C_STAT  = curses.color_pair(5) | curses.A_BOLD
+    C_NORM  = curses.color_pair(6)
+    C_HDR   = curses.color_pair(7)
+    C_HDRG  = curses.color_pair(8)
+
+    start_ts = time.monotonic()
+
+    def put(r, c, text, attr=None):
+        if attr is None: attr = C_NORM
+        rows, cols = stdscr.getmaxyx()
+        if r >= rows - 1 or c >= cols: return
+        try: stdscr.addstr(r, c, text[:cols - c], attr)
+        except curses.error: pass
+
+    def hline(r, char="─", attr=None):
+        if attr is None: attr = C_NORM
+        rows, cols = stdscr.getmaxyx()
+        put(r, 0, char * cols, attr)
+
+    while True:
+        key = stdscr.getch()
+        if key == ord('q'): break
+
+        stdscr.erase()
+        rows, cols = stdscr.getmaxyx()
+        pid = is_running()
+        st  = db_stats()
+        logs = read_log_tail(rows)
+
+        elapsed   = time.monotonic() - start_ts
+        speed_bps = st["speed_mbps"] * (1 << 20)
+        eta_str   = _fmt_eta(st["remaining_b"], speed_bps)
+        global_pct = st["sent_b"] / max(st["total_b"], 1) * 100
+
+        row = 0
+
+        # ── HEADER ───────────────────────────────────────────────────────────
+        status_tag = f"PID {pid}" if pid else "ARRÊTÉ"
+        hdr_attr   = C_HDR if pid else curses.color_pair(4) | curses.A_BOLD
+        hdr = f" ⚡ SPOOL TURBO  ·  {WORKERS} workers  ·  NAS {NAS_HOST}  ·  {status_tag} "
+        put(row, 0, hdr.ljust(cols)[:cols], hdr_attr); row += 1
+
+        # ── COMPTEURS ────────────────────────────────────────────────────────
+        hline(row); row += 1
+        put(row,  2, f"✓ {st['done']} envoyées",       C_OK)
+        put(row, 22, f"⧖ {st['queued']} en attente",   C_WARN)
+        put(row, 42, f"⚙ {st['processing']} actifs",   C_STAT)
+        put(row, 60, f"✗ {st['failed']} échecs",        C_ERR if st['failed'] else C_NORM)
+        put(row, 76, f"up {int(elapsed//3600):02d}h{int((elapsed%3600)//60):02d}m", C_NORM)
+        row += 1
+
+        # ── BARRE GLOBALE ─────────────────────────────────────────────────────
+        hline(row); row += 1
+        bar_w = max(10, cols - 32)
+        put(row, 2, "Global  ", C_TITLE)
+        put(row, 10, _bar(global_pct, bar_w), C_OK if global_pct > 50 else C_WARN)
+        put(row, 10 + bar_w + 1, f"{global_pct:5.1f}%", C_STAT)
+        put(row, 10 + bar_w + 8, f"  {_fmt_size(st['sent_b'])} / {_fmt_size(st['total_b'])}", C_NORM)
+        row += 1
+
+        # ── VITESSE + ETA ─────────────────────────────────────────────────────
+        put(row, 2, "Vitesse  ", C_TITLE)
+        put(row, 11, f"{st['speed_mbps']:6.1f} MB/s", C_STAT)
+        put(row, 28, f"  restant {_fmt_size(st['remaining_b'])}", C_NORM)
+        put(row, 50, f"  ETA  {eta_str}", C_WARN if eta_str != "--:--" else C_NORM)
+        row += 1
+
+        # ── BARRE PROCESSING ──────────────────────────────────────────────────
+        hline(row); row += 1
+        n_proc = st["processing"]
+        n_queue = st["queued"]
+        bar_proc_w = max(10, cols - 32)
+        proc_pct = n_proc / max(WORKERS, 1) * 100
+        put(row, 2, "Workers  ", C_TITLE)
+        put(row, 11, _bar(proc_pct, bar_proc_w), C_STAT)
+        put(row, 11 + bar_proc_w + 1, f"{n_proc:2d}/{WORKERS}", C_STAT)
+        put(row, 11 + bar_proc_w + 7, f"  {n_queue} session(s) en attente", C_WARN if n_queue else C_NORM)
+        row += 1
+
+        # ── LOGS ─────────────────────────────────────────────────────────────
+        hline(row); row += 1
+        put(row, 2, "Logs  (q = quitter le visuel, le daemon continue)", C_TITLE); row += 1
+        hline(row, "╌"); row += 1
+
+        avail = rows - row - 1
+        visible = logs[-avail:] if avail > 0 else []
+        for line in visible:
+            lo = line.lower()
+            attr = (C_ERR  if "error" in lo or "failed" in lo or "échec" in lo
+               else C_WARN if "warning" in lo or "warn" in lo or "retry" in lo
+               else C_OK   if "done" in lo or "envoyé" in lo or "ok" in lo
+               else C_NORM)
+            put(row, 1, line[:cols - 2], attr)
+            row += 1
+            if row >= rows - 1: break
+
+        stdscr.refresh()
+        time.sleep(0.25)
+
+curses.wrapper(main)
+PYEOF
+}
+
+# ── ENTRY POINT ───────────────────────────────────────────────────────────────
+
+CMD="${1:-run}"
+
+case "$CMD" in
+    stop)
+        banner
+        stop_daemon
+        ;;
+    restart)
+        banner
+        stop_daemon
+        sleep 1
+        start_daemon
+        attach_tui
+        ;;
+    status)
+        banner
+        show_status
+        ;;
+    logs)
+        tail -f "$LOG_FILE"
+        ;;
+    run|"")
+        banner
+        start_daemon
+        attach_tui
+        ;;
+    *)
+        echo "Usage: $0 [run|stop|restart|status|logs]"
+        exit 1
+        ;;
+esac

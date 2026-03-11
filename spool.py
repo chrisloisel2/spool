@@ -19,6 +19,9 @@ import traceback
 import random
 import socket
 
+import curses
+import collections
+
 import paramiko
 
 # =========================
@@ -30,15 +33,15 @@ SPOOL_DIR = "/srv/exoria/spool"
 QUARANTINE_DIR = "/srv/exoria/quarantine"
 DB_PATH = "/srv/exoria/queue.db"
 
-SCAN_INTERVAL = 1
+SCAN_INTERVAL = 1  # déjà à 1s — optimal
 
 # Nombre de workers NAS en parallèle.
 # 1 = tout dans le thread principal (pas de threads supplémentaires).
 # >1 = scanner + N workers chacun dans leur propre thread.
-WORKERS = 4
+WORKERS = 16  # TURBO: 16 connexions SFTP simultanées
 
 MAX_RETRIES = 8
-RETRY_BACKOFF = 2
+RETRY_BACKOFF = 1  # TURBO: backoff réduit à 1s
 
 # NAS (destination finale)
 NAS_HOST = "192.168.88.82"
@@ -59,17 +62,17 @@ WRITE_MANIFEST = False     # désactivé pour vitesse max — une écriture NAS 
 # DURCISSEMENT SSH/SFTP (banner reset)
 # =========================
 
-# Nombre max de connexions NAS simultanées (= WORKERS en pratique, laisser à 1 sauf besoin).
-NAS_MAX_SIMULT_CONNECT = 4
+# Nombre max de connexions NAS simultanées — TURBO: aligné sur WORKERS
+NAS_MAX_SIMULT_CONNECT = 16
 SSH_TIMEOUT = 20
 BANNER_TIMEOUT = 90
 AUTH_TIMEOUT = 30
 KEEPALIVE_SEC = 30
 
-# Tuning SFTP — buffers larges pour maximiser le débit
+# Tuning SFTP — TURBO: buffers max pour saturer le réseau
 SFTP_WINDOW_SIZE  = 134217728   # 128 MB — fenêtre SSH max
 SFTP_MAX_PACKET   = 65536        # 64 KB — paquet SFTP max
-SFTP_READ_BUFFER  = 4194304      # 4 MB  — buffer lecture locale
+SFTP_READ_BUFFER  = 8388608      # TURBO: 8 MB — buffer lecture locale (x2)
 
 # =========================
 # CONFIG KAFKA
@@ -90,9 +93,12 @@ except ImportError:
 # LOG (maximum)
 # =========================
 
+LOG_FILE = "/srv/exoria/spool.log"
+
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s %(levelname)s %(threadName)s %(message)s",
+    handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8")],
 )
 log = logging.getLogger("spool")
 
@@ -441,6 +447,279 @@ class SpoolReporter(threading.Thread):
 REPORTER = SpoolReporter()
 
 # =========================
+# TUI — Terminal UI (curses)
+# =========================
+
+# Shared state updated by workers & scanner, read by TUI thread
+_TUI_LOCK = threading.Lock()
+_tui_active_transfers: dict = {}   # worker_idx -> {session_id, files_done, file_count, bytes_sent, total_bytes, speed_mbps, t_start}
+_tui_done_count    = 0
+_tui_failed_count  = 0
+_tui_queued_count  = 0
+_tui_total_bytes_session = 0       # bytes total de tous les jobs au démarrage
+_tui_bytes_sent_total    = 0       # bytes effectivement envoyés depuis démarrage
+_tui_speed_history: collections.deque = collections.deque(maxlen=10)  # moyennes glissantes MB/s
+_tui_log_lines: collections.deque = collections.deque(maxlen=200)     # derniers messages log
+_tui_start_ts  = time.monotonic()
+_tui_enabled   = True
+
+def tui_update_transfer(worker_idx: int, info: dict | None):
+    global _tui_active_transfers
+    with _TUI_LOCK:
+        if info is None:
+            _tui_active_transfers.pop(worker_idx, None)
+        else:
+            _tui_active_transfers[worker_idx] = info
+
+def tui_inc_done(bytes_sent: int):
+    global _tui_done_count, _tui_bytes_sent_total
+    with _TUI_LOCK:
+        _tui_done_count += 1
+        _tui_bytes_sent_total += bytes_sent
+
+def tui_inc_failed():
+    global _tui_failed_count
+    with _TUI_LOCK:
+        _tui_failed_count += 1
+
+def tui_set_queue(n: int, total_bytes: int):
+    global _tui_queued_count, _tui_total_bytes_session
+    with _TUI_LOCK:
+        _tui_queued_count = n
+        _tui_total_bytes_session = total_bytes
+
+def tui_push_speed(mbps: float):
+    with _TUI_LOCK:
+        _tui_speed_history.append(mbps)
+
+def tui_log(msg: str):
+    with _TUI_LOCK:
+        ts = dt.datetime.now().strftime("%H:%M:%S")
+        _tui_log_lines.append(f"{ts}  {msg}")
+
+
+def _fmt_size(b: int) -> str:
+    if b >= 1 << 30:
+        return f"{b / (1<<30):.1f} GB"
+    if b >= 1 << 20:
+        return f"{b / (1<<20):.1f} MB"
+    if b >= 1 << 10:
+        return f"{b / (1<<10):.0f} KB"
+    return f"{b} B"
+
+def _fmt_eta(remaining_bytes: int, speed_bps: float) -> str:
+    if speed_bps <= 0 or remaining_bytes <= 0:
+        return "--:--"
+    secs = int(remaining_bytes / speed_bps)
+    h, r = divmod(secs, 3600)
+    m, s = divmod(r, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    if m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
+
+def _bar(pct: float, width: int = 20, filled="█", empty="░") -> str:
+    n = int(pct / 100 * width)
+    n = max(0, min(n, width))
+    return filled * n + empty * (width - n)
+
+
+class SpoolTUI(threading.Thread):
+    REFRESH_HZ = 4   # redraws per second
+
+    def __init__(self):
+        super().__init__(daemon=True, name="tui")
+
+    def run(self):
+        try:
+            curses.wrapper(self._loop)
+        except Exception:
+            pass  # si le terminal ne supporte pas curses, on ignore silencieusement
+
+    def _loop(self, stdscr):
+        curses.curs_set(0)
+        stdscr.nodelay(True)
+        curses.start_color()
+        curses.use_default_colors()
+
+        # Paires de couleurs
+        curses.init_pair(1, curses.COLOR_CYAN,    -1)   # titre / header
+        curses.init_pair(2, curses.COLOR_GREEN,   -1)   # succès / done
+        curses.init_pair(3, curses.COLOR_YELLOW,  -1)   # en cours / warning
+        curses.init_pair(4, curses.COLOR_RED,     -1)   # erreur / failed
+        curses.init_pair(5, curses.COLOR_MAGENTA, -1)   # vitesse / stats
+        curses.init_pair(6, curses.COLOR_WHITE,   -1)   # texte normal
+        curses.init_pair(7, curses.COLOR_BLACK,   curses.COLOR_CYAN)  # header bar
+
+        C_TITLE  = curses.color_pair(1) | curses.A_BOLD
+        C_OK     = curses.color_pair(2)
+        C_WARN   = curses.color_pair(3)
+        C_ERR    = curses.color_pair(4)
+        C_STAT   = curses.color_pair(5) | curses.A_BOLD
+        C_NORM   = curses.color_pair(6)
+        C_HDR    = curses.color_pair(7)
+
+        interval = 1.0 / self.REFRESH_HZ
+
+        while True:
+            key = stdscr.getch()
+            if key == ord('q'):
+                break
+
+            stdscr.erase()
+            rows, cols = stdscr.getmaxyx()
+
+            # Snapshot thread-safe
+            with _TUI_LOCK:
+                active   = dict(_tui_active_transfers)
+                done     = _tui_done_count
+                failed   = _tui_failed_count
+                queued   = _tui_queued_count
+                total_b  = _tui_total_bytes_session
+                sent_b   = _tui_bytes_sent_total
+                speeds   = list(_tui_speed_history)
+                logs     = list(_tui_log_lines)
+
+            elapsed   = time.monotonic() - _tui_start_ts
+            avg_speed = sum(speeds) / len(speeds) if speeds else 0.0
+            # vitesse instantanée = somme des workers actifs
+            live_speed = sum(t.get("speed_mbps", 0) for t in active.values())
+            speed_bps  = live_speed * (1 << 20)
+
+            # bytes en cours (workers actifs)
+            active_bytes_sent  = sum(t.get("bytes_sent", 0) for t in active.values())
+            active_bytes_total = sum(t.get("total_bytes", 1) for t in active.values())
+
+            # ETA globale : bytes restants = (total session - déjà envoyé - en cours)
+            global_remaining = max(0, total_b - sent_b - active_bytes_sent)
+            eta_str = _fmt_eta(global_remaining, speed_bps)
+
+            # Progression globale
+            global_pct = (sent_b + active_bytes_sent) / max(total_b, 1) * 100
+
+            row = 0
+
+            def put(r, c, text, attr=C_NORM):
+                if r >= rows - 1 or c >= cols:
+                    return
+                try:
+                    stdscr.addstr(r, c, text[:cols - c], attr)
+                except curses.error:
+                    pass
+
+            def hline(r, char="─", attr=C_NORM):
+                put(r, 0, char * cols, attr)
+
+            # ── HEADER ───────────────────────────────────────────────────────
+            header = f" ⚡ SPOOL TURBO  ·  {WORKERS} workers  ·  NAS {NAS_HOST} "
+            header = header.ljust(cols)
+            put(row, 0, header[:cols], C_HDR)
+            row += 1
+
+            # ── STATS GLOBALES ───────────────────────────────────────────────
+            hline(row, "─"); row += 1
+
+            done_s    = f"✓ {done} envoyées"
+            queued_s  = f"⧖ {queued} en attente"
+            failed_s  = f"✗ {failed} échecs"
+            active_s  = f"⇢ {len(active)} actifs"
+            uptime_s  = f"up {int(elapsed//3600):02d}h{int((elapsed%3600)//60):02d}m"
+
+            put(row, 2,  done_s,   C_OK);   put(row, 22, queued_s, C_WARN)
+            put(row, 42, failed_s, C_ERR);  put(row, 60, active_s, C_STAT)
+            put(row, 76, uptime_s, C_NORM)
+            row += 1
+
+            # ── BARRE PROGRESSION GLOBALE ────────────────────────────────────
+            hline(row, "─"); row += 1
+            bar_w = max(10, cols - 30)
+            gbar = _bar(global_pct, bar_w)
+            put(row, 2, f"Global  ", C_TITLE)
+            put(row, 10, gbar, C_OK if global_pct > 50 else C_WARN)
+            put(row, 10 + bar_w + 1, f"{global_pct:5.1f}%", C_STAT)
+            put(row, 10 + bar_w + 8, f"  {_fmt_size(sent_b + active_bytes_sent)} / {_fmt_size(total_b)}", C_NORM)
+            row += 1
+
+            # Vitesse + ETA
+            put(row, 2, f"Vitesse  ", C_TITLE)
+            put(row, 11, f"{live_speed:6.1f} MB/s", C_STAT)
+            put(row, 25, f"  moy {avg_speed:.1f} MB/s", C_NORM)
+            put(row, 44, f"  ETA  {eta_str}", C_WARN if eta_str != "--:--" else C_NORM)
+            row += 1
+
+            # ── TRANSFERTS ACTIFS ────────────────────────────────────────────
+            hline(row, "─"); row += 1
+            put(row, 2, f"Transferts actifs ({len(active)})", C_TITLE); row += 1
+            hline(row, "╌"); row += 1
+
+            bar_w2 = max(10, cols - 55)
+            for widx in sorted(active.keys()):
+                if row >= rows - 6:
+                    put(row, 4, f"  … {len(active) - (widx - min(active.keys()))} de plus …", C_NORM)
+                    row += 1
+                    break
+                t      = active[widx]
+                sid    = t.get("session_id", "?")[-22:]
+                fd     = t.get("files_done", 0)
+                fc     = t.get("file_count", 1)
+                bs     = t.get("bytes_sent", 0)
+                bt     = t.get("total_bytes", 1)
+                spd    = t.get("speed_mbps", 0.0)
+                pct    = bs / max(bt, 1) * 100
+                tbar   = _bar(pct, bar_w2)
+                label  = f"W{widx:02d} {sid}"
+                label  = label[:24].ljust(24)
+                put(row, 2, label, C_NORM)
+                put(row, 27, tbar, C_OK if pct > 50 else C_WARN)
+                put(row, 27 + bar_w2 + 1, f"{pct:5.1f}%", C_STAT)
+                put(row, 27 + bar_w2 + 8, f" {fd}/{fc}f  {spd:.1f}MB/s", C_NORM)
+                row += 1
+
+            if not active:
+                put(row, 4, "  (aucun transfert en cours)", C_NORM); row += 1
+
+            # ── LOG ──────────────────────────────────────────────────────────
+            hline(row, "─"); row += 1
+            put(row, 2, "Logs récents  (q = quitter)", C_TITLE); row += 1
+            hline(row, "╌"); row += 1
+
+            log_lines_avail = rows - row - 1
+            visible = logs[-log_lines_avail:] if log_lines_avail > 0 else []
+            for line in visible:
+                attr = C_ERR if "ERR" in line or "échec" in line.lower() or "failed" in line.lower() \
+                      else C_WARN if "WARN" in line or "retry" in line.lower() \
+                      else C_OK if "done" in line.lower() or "envoyée" in line.lower() \
+                      else C_NORM
+                put(row, 2, line[:cols - 3], attr)
+                row += 1
+                if row >= rows - 1:
+                    break
+
+            stdscr.refresh()
+            time.sleep(interval)
+
+
+TUI = SpoolTUI()
+
+# Hook dans le logger pour alimenter le panneau logs TUI
+class _TuiLogHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            # ligne courte pour le TUI
+            short = msg.split("%(")[-1] if "%(" in msg else msg
+            tui_log(self.format(record))
+        except Exception:
+            pass
+
+_tui_handler = _TuiLogHandler()
+_tui_handler.setLevel(logging.INFO)
+_tui_handler.setFormatter(logging.Formatter("%(levelname)s %(threadName)s %(message)s"))
+log.addHandler(_tui_handler)
+
+
+# =========================
 # UTILS
 # =========================
 
@@ -717,7 +996,7 @@ class Scanner(threading.Thread):
             except Exception as e:
                 log.error("[Scanner] Impossible d'enregistrer la session '%s' : %s\n%s", name, e, traceback.format_exc())
 
-        # Mise à jour reporter
+        # Mise à jour reporter + TUI
         try:
             rows = self.conn.execute(
                 "SELECT id, session_id, size_bytes, file_count, created_at FROM jobs WHERE status='queued' ORDER BY created_at ASC"
@@ -732,6 +1011,8 @@ class Scanner(threading.Thread):
                 for r in rows
             ]
             REPORTER.set_inbound_queue(queue)
+            total_q_bytes = sum((r[2] or 0) for r in rows)
+            tui_set_queue(len(rows), total_q_bytes)
         except Exception as e:
             log.debug("[Scanner] Reporter queue update failed: %s", e)
 
@@ -775,7 +1056,7 @@ class Worker(threading.Thread):
         while True:
             job = self.get_job()
             if not job:
-                time.sleep(1)
+                time.sleep(0.2)  # TURBO: poll plus fréquent (200ms au lieu de 1s)
                 continue
             self.process(job)
 
@@ -811,6 +1092,14 @@ class Worker(threading.Thread):
         log.info("[JOB %s] Session '%s' — %d fichiers, %.1f MB, tentative %d",
                  jid[:8], session_id, file_count, (size_bytes or 0) / (1024*1024), attempts)
 
+        tui_update_transfer(self.idx, {
+            "session_id": session_id,
+            "files_done": 0,
+            "file_count": file_count,
+            "bytes_sent": 0,
+            "total_bytes": size_bytes or 1,
+            "speed_mbps": 0.0,
+        })
         REPORTER.set_current_transfer({
             "session_id": session_id,
             "progress_pct": 0,
@@ -845,6 +1134,15 @@ class Worker(threading.Thread):
                 elapsed = max(time.monotonic() - t_start, 0.001)
                 speed = round(bytes_sent / (1024*1024) / elapsed, 2)
 
+                tui_update_transfer(self.idx, {
+                    "session_id": session_id,
+                    "files_done": i + 1,
+                    "file_count": len(files),
+                    "bytes_sent": bytes_sent,
+                    "total_bytes": total_bytes,
+                    "speed_mbps": speed,
+                })
+                tui_push_speed(speed)
                 REPORTER.set_current_transfer({
                     "session_id": session_id,
                     "progress_pct": pct,
@@ -868,6 +1166,8 @@ class Worker(threading.Thread):
             REPORTER.inc_processed()
             REPORTER.inc_forwarded()
             REPORTER.set_current_transfer(None)
+            tui_update_transfer(self.idx, None)
+            tui_inc_done(size_bytes or 0)
 
             if DELETE_LOCAL_AFTER_SUCCESS:
                 try:
@@ -921,6 +1221,8 @@ class Worker(threading.Thread):
             REPORTER.inc_processed()
             REPORTER.inc_failed()
             REPORTER.set_current_transfer(None)
+            tui_update_transfer(self.idx, None)
+            tui_inc_failed()
 
             log.error("[JOB %s] Job définitivement échoué après %d tentatives.", jid[:8], attempts)
 
@@ -977,6 +1279,24 @@ def main():
 
     REPORTER.set_db(conn)
     REPORTER.start()
+
+    # Initialise les compteurs TUI depuis la DB (sessions déjà connues)
+    try:
+        r = conn.execute(
+            "SELECT COUNT(*), SUM(size_bytes) FROM jobs WHERE status IN ('queued','processing')"
+        ).fetchone()
+        tui_set_queue(r[0] or 0, r[1] or 0)
+
+        r2 = conn.execute("SELECT COUNT(*) FROM jobs WHERE status='done'").fetchone()
+        r3 = conn.execute("SELECT COUNT(*) FROM jobs WHERE status='failed'").fetchone()
+        global _tui_done_count, _tui_failed_count
+        with _TUI_LOCK:
+            _tui_done_count  = r2[0] or 0
+            _tui_failed_count = r3[0] or 0
+    except Exception:
+        pass
+
+    TUI.start()
 
     if WORKERS == 1:
         log.info("[App] Démarrage en mode mono-thread.")
