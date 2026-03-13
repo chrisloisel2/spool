@@ -10,6 +10,40 @@ PYTHON="$(command -v python3)"
 LOG_FILE="/srv/exoria/spool.log"
 PID_FILE="/tmp/spool_daemon.pid"
 
+KAFKA_BROKER="192.168.88.4:9092"
+KAFKA_TOPIC="monitoring"
+
+# ── KAFKA EMIT ────────────────────────────────────────────────────────────────
+kafka_emit() {
+    local step="$1" status="$2" extra="${3:-}"
+    "$PYTHON" - <<PYEOF 2>/dev/null || true
+import json, time, datetime as dt
+try:
+    from kafka import KafkaProducer
+    p = KafkaProducer(
+        bootstrap_servers=["${KAFKA_BROKER}"],
+        value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode("utf-8"),
+        api_version=(2, 0, 0),
+        retries=3,
+        request_timeout_ms=5000,
+    )
+    ev = {
+        "source":  "spool_daemon",
+        "ts":      time.time(),
+        "ts_iso":  dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "step":    "${step}",
+        "status":  "${status}",
+    }
+    extra = ${extra:-{}}
+    ev.update(extra)
+    p.send("${KAFKA_TOPIC}", ev)
+    p.flush(timeout=5)
+    p.close()
+except Exception as e:
+    pass
+PYEOF
+}
+
 # Couleurs
 R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; C='\033[0;36m'; B='\033[1m'; N='\033[0m'
 
@@ -58,9 +92,11 @@ start_daemon() {
     if kill -0 "$pid" 2>/dev/null; then
         ok "Daemon démarré  (pid=$pid)"
         ok "Logs : $LOG_FILE"
+        kafka_emit "daemon" "started" "{\"pid\": $pid, \"log\": \"$LOG_FILE\", \"workers\": 16, \"nas_host\": \"192.168.88.82\"}"
     else
         err "Le daemon a planté au démarrage. Consulte les logs :"
         tail -20 "$LOG_FILE" | sed 's/^/    /'
+        kafka_emit "daemon" "start_failed" "{\"log\": \"$LOG_FILE\"}"
         exit 1
     fi
 }
@@ -88,6 +124,7 @@ stop_daemon() {
 
     rm -f "$PID_FILE"
     ok "Daemon arrêté."
+    kafka_emit "daemon" "stopped" "{\"pid\": $pid}"
 }
 
 show_status() {
@@ -346,13 +383,20 @@ case "$CMD" in
     logs)
         tail -f "$LOG_FILE"
         ;;
+    watch)
+        # Affiche uniquement les snapshots [Spool] en temps réel (1/s)
+        banner
+        info "Snapshots [Spool] en direct (Ctrl-C pour quitter)..."
+        echo ""
+        tail -f "$LOG_FILE" | grep --line-buffered "\[Spool\]"
+        ;;
     run|"")
         banner
         start_daemon
         attach_tui
         ;;
     *)
-        echo "Usage: $0 [run|stop|restart|status|logs]"
+        echo "Usage: $0 [run|stop|restart|status|logs|watch]"
         exit 1
         ;;
 esac

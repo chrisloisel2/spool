@@ -355,8 +355,27 @@ class SpoolReporter(threading.Thread):
         disk  = self._disk_usage()
         uptime_s = int(time.time() - self._start_ts)
 
-        log.debug("[Reporter] Snapshot : queue=%d transfer=%s failed=%d",
-                  len(queue), transfer, failed)
+        # ── Log périodique (1/s) — lisible dans spool.log / run.sh logs ─────────
+        n_queued     = db.get("queued", len(queue))
+        n_processing = db.get("processing", 0)
+        n_done       = db.get("done", 0)
+        n_failed_db  = db.get("failed", 0)
+        queued_mb    = db.get("queued_mb", 0.0)
+        xfer = transfer or {}
+        xfer_str = (
+            f"  xfer={xfer.get('session_id','?')} {xfer.get('progress_pct',0):.0f}%"
+            f" @ {xfer.get('speed_mbps',0):.1f} MB/s"
+            if xfer else "  xfer=idle"
+        )
+        up_h, up_r  = divmod(uptime_s, 3600)
+        up_m, up_s_ = divmod(up_r, 60)
+        log.info(
+            "[Spool] up=%02dh%02dm%02ds  queued=%d (%.1f MB)  processing=%d"
+            "  done=%d  failed=%d%s",
+            up_h, up_m, up_s_,
+            n_queued, queued_mb, n_processing,
+            n_done, n_failed_db, xfer_str,
+        )
 
         if not HAS_KAFKA:
             return
