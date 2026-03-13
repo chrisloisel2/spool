@@ -279,34 +279,32 @@ class SpoolReporter(threading.Thread):
 
             # 5 derniers jobs failed avec leur erreur
             failed_jobs = self._conn.execute(
-                "SELECT id, sender, original_name, size_bytes, attempts, last_error, updated_at "
+                "SELECT id, session_id, size_bytes, attempts, last_error, updated_at "
                 "FROM jobs WHERE status='failed' ORDER BY updated_at DESC LIMIT 5"
             ).fetchall()
             recent_failed = [
                 {
                     "job_id":    r[0][:8],
-                    "sender":    r[1],
-                    "file":      r[2],
-                    "size_mb":   round((r[3] or 0) / (1024*1024), 2),
-                    "attempts":  r[4],
-                    "error":     (r[5] or "")[:120],
-                    "failed_at": r[6],
+                    "session":   r[1],
+                    "size_mb":   round((r[2] or 0) / (1024*1024), 2),
+                    "attempts":  r[3],
+                    "error":     (r[4] or "")[:120],
+                    "failed_at": r[5],
                 }
                 for r in failed_jobs
             ]
 
             # 5 derniers jobs done
             done_jobs = self._conn.execute(
-                "SELECT id, sender, original_name, size_bytes, updated_at "
+                "SELECT id, session_id, size_bytes, updated_at "
                 "FROM jobs WHERE status='done' ORDER BY updated_at DESC LIMIT 5"
             ).fetchall()
             recent_done = [
                 {
                     "job_id":       r[0][:8],
-                    "sender":       r[1],
-                    "file":         r[2],
-                    "size_mb":      round((r[3] or 0) / (1024*1024), 2),
-                    "completed_at": r[4],
+                    "session":      r[1],
+                    "size_mb":      round((r[2] or 0) / (1024*1024), 2),
+                    "completed_at": r[3],
                 }
                 for r in done_jobs
             ]
