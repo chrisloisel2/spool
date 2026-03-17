@@ -86,32 +86,25 @@ get_frame_count() {
 analyze_video_metrics() {
   local file="$1"
 
+  # Extraction avec sed POSIX (pas de match() GAWK)
   ffmpeg -v info -i "$file" \
     -vf "signalstats,blurdetect=block_width=32:block_height=32:block_pct=80" \
     -an -f null - 2>&1 | awk '
+      function extract(line, key,    val, i) {
+        i = index(line, key "=")
+        if (i == 0) return ""
+        val = substr(line, i + length(key) + 1)
+        sub(/[^0-9.].*/, "", val)
+        return val
+      }
       /lavfi\.signalstats\.YAVG=/ {
-        if (match($0, /lavfi\.signalstats\.YAVG=([0-9.]+)/, m)) {
-          yavg_sum += m[1]
-          yavg_n++
-        }
-        if (match($0, /lavfi\.signalstats\.YDIF=([0-9.]+)/, m2)) {
-          ydif_sum += m2[1]
-          ydif_n++
-        }
-        if (match($0, /lavfi\.signalstats\.YMIN=([0-9.]+)/, m3)) {
-          ymin_sum += m3[1]
-          ymin_n++
-        }
-        if (match($0, /lavfi\.signalstats\.YMAX=([0-9.]+)/, m4)) {
-          ymax_sum += m4[1]
-          ymax_n++
-        }
+        v = extract($0, "lavfi.signalstats.YAVG"); if (v != "") { yavg_sum += v; yavg_n++ }
+        v = extract($0, "lavfi.signalstats.YDIF"); if (v != "") { ydif_sum += v; ydif_n++ }
+        v = extract($0, "lavfi.signalstats.YMIN"); if (v != "") { ymin_sum += v; ymin_n++ }
+        v = extract($0, "lavfi.signalstats.YMAX"); if (v != "") { ymax_sum += v; ymax_n++ }
       }
       /lavfi\.blurdetect\.blur=/ {
-        if (match($0, /lavfi\.blurdetect\.blur=([0-9.]+)/, b)) {
-          blur_sum += b[1]
-          blur_n++
-        }
+        v = extract($0, "lavfi.blurdetect.blur"); if (v != "") { blur_sum += v; blur_n++ }
       }
       END {
         if (blur_n == 0) blur_n = 1
@@ -350,10 +343,12 @@ main() {
 
   for cam in head left right; do
     local file="$VIDEOS_DIR/${cam}.mp4"
-    score_video "$cam" "$file"
+    local cam_output
+    cam_output="$(score_video "$cam" "$file")"
+    echo "$cam_output"
 
     local note
-    note="$(score_video "$cam" "$file" | awk -F': ' '/^NOTE FINALE:/{print $2}' | awk "{print \$1}" | tail -n1)"
+    note="$(echo "$cam_output" | awk -F': ' '/^NOTE FINALE:/{print $2}' | awk '{print $1}' | tail -n1)"
     [[ -n "$note" ]] || fail "Impossible de calculer la note pour $cam"
     echo "$note $cam" >> "$tmp_scores"
   done

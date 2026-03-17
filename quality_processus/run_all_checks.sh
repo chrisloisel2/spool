@@ -20,7 +20,8 @@ fi
 extract_quality_details() {
   local session_dir="$1"
   local output
-  output="$("$SCRIPT_DIR/quality.sh" "$session_dir" 2>/dev/null)" || { echo "{}"; return; }
+  output="$("$SCRIPT_DIR/quality.sh" "$session_dir" 2>/dev/null || true)"
+  [[ -z "$output" ]] && { echo "{}"; return; }
 
   echo "$output" | awk '
     /^VIDEO:/ { cam = $2 }
@@ -140,9 +141,11 @@ process_session() {
 
   # ── 3. quality.sh ─────────────────────────────────────────────────────────
   local quality_details
-  quality_details="$(extract_quality_details "$session_dir")"
+  quality_details="$(extract_quality_details "$session_dir")" || quality_details="{}"
+  [[ -z "$quality_details" ]] && quality_details="{}"
   local score
-  score="$(echo "$quality_details" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("score_avg",0))')"
+  score="$(echo "$quality_details" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("score_avg",0))' 2>/dev/null)" || score=0
+  [[ -z "$score" ]] && score=0
 
   # ── 4. verify_naming.sh ───────────────────────────────────────────────────
   local naming_result naming_ok

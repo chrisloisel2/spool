@@ -67,14 +67,14 @@
   "end_time": "2026-03-08T15:18:58.812008+00:00",
   "duration_seconds": 20.256521300001623,
   "failed": false,
-  "quality_score": 0.0,
+  "quality_score": 67.8,
   "quality_label": "bad",
-  "quality_checked_at": "2026-03-17T11:46:47Z",
+  "quality_checked_at": "2026-03-17T12:54:13Z",
   "quality_report": {
     "status": "ok",
-    "score": 0.0,
+    "score": 67.8,
     "label": "bad",
-    "checked_at": "2026-03-17T11:46:47Z",
+    "checked_at": "2026-03-17T12:54:13Z",
     "fixes_applied": [],
     "checks": {
       "files": {
@@ -106,8 +106,30 @@
         "errors": []
       },
       "quality": {
-        "score_avg": 0,
-        "cameras": {}
+        "score_avg": 67.8,
+        "cameras": {
+          "left": {
+            "score": 67.8,
+            "sharpness": 50.0,
+            "exposure": 7.4,
+            "clipping": 9.4,
+            "motion": 1.0
+          },
+          "right": {
+            "score": 67.8,
+            "sharpness": 50.0,
+            "exposure": 7.4,
+            "clipping": 9.4,
+            "motion": 1.0
+          },
+          "head": {
+            "score": 67.8,
+            "sharpness": 50.0,
+            "exposure": 7.4,
+            "clipping": 9.4,
+            "motion": 1.0
+          }
+        }
       },
       "naming": {
         "passed": false,
