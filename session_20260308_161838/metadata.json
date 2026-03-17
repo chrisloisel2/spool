@@ -66,5 +66,8 @@
   "precise_timer": true,
   "end_time": "2026-03-08T15:18:58.812008+00:00",
   "duration_seconds": 20.256521300001623,
-  "failed": false
+  "failed": false,
+  "quality_score": 0,
+  "quality_label": "bad",
+  "quality_checked_at": "2026-03-17T11:28:46Z"
 }

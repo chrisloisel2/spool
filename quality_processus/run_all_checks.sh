@@ -55,7 +55,7 @@ process_session() {
 
   # 4. verify_naming.sh — pénalité si échec
   local naming_ok=true
-  python3 "$SCRIPT_DIR/verify_naming.sh" "$session_dir" >/dev/null 2>&1 || naming_ok=false
+  bash "$SCRIPT_DIR/verify_naming.sh" "$session_dir" >/dev/null 2>&1 || naming_ok=false
 
   # Calcul label
   local label
