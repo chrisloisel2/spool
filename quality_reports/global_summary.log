@@ -1,0 +1,13 @@
+========================================
+GLOBAL QUALITY REPORT
+DATE: 2026-03-17 13:38:29
+SPOOL: /Users/christopher/spool
+
+SESSION                                   RESULT
+-------                                   ------
+session_20260308_161838                   FAIL
+
+TOTAL: 1 sessions
+PASS:  0
+FAIL:  1
+========================================

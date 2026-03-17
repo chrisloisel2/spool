@@ -1,3 +1,144 @@
+# Kafka Events — spool
+
+## Infra
+
+| Paramètre | Valeur |
+|-----------|--------|
+| Broker | `192.168.88.4:9092` |
+| Topic | `monitoring` |
+| Acks | `all` (spool.py) / non configuré (run.sh) |
+| Retries | `10` (spool.py) / `3` (run.sh) |
+| API version | `2.0` |
+
+---
+
+## Sources
+
+| `source` | Émetteur | Fréquence |
+|----------|----------|-----------|
+| `spool_daemon` | `run.sh` | À chaque start / stop / erreur démarrage |
+| `spool_status` | `spool.py` → `SpoolReporter` | Toutes les secondes |
+| `pc` | `spool.py` → `SpoolReporter` | Toutes les secondes (un msg par pc_id actif) |
+
+---
+
+## Events émis par `run.sh` (`source = "spool_daemon"`)
+
+### Structure commune
+
+Tous les messages de `run.sh` partagent ces champs de base :
+
+```json
+{
+  "source":  "spool_daemon",
+  "ts":      1772984655.162,
+  "ts_iso":  "2026-03-13T02:25:00Z",
+  "step":    "<step>",
+  "status":  "<status>"
+}
+```
+
+| Champ | Type | Description |
+|-------|------|-------------|
+| `source` | `string` | Toujours `"spool_daemon"` |
+| `ts` | `float` | Unix timestamp (secondes) |
+| `ts_iso` | `string` | UTC ISO 8601, précision seconde (`Z`) |
+| `step` | `string` | Catégorie de l'event |
+| `status` | `string` | État dans la catégorie |
+
+---
+
+### `step = "daemon"` — Lifecycle du processus spool
+
+#### `daemon / started`
+Émis après que le daemon a démarré avec succès (vérification 2s après `nohup`).
+
+```json
+{
+  "source":   "spool_daemon",
+  "ts":       1772984655.162,
+  "ts_iso":   "2026-03-13T02:25:00Z",
+  "step":     "daemon",
+  "status":   "started",
+  "pid":      9677,
+  "log":      "/srv/exoria/spool.log",
+  "workers":  16,
+  "nas_host": "192.168.88.82"
+}
+```
+
+| Champ | Type | Description |
+|-------|------|-------------|
+| `pid` | `int` | PID du processus daemon |
+| `log` | `string` | Chemin du fichier de log |
+| `workers` | `int` | Nombre de workers SFTP configurés (16) |
+| `nas_host` | `string` | IP du NAS cible |
+
+---
+
+#### `daemon / start_failed`
+Émis si le daemon crashe dans les 2 premières secondes après le lancement.
+
+```json
+{
+  "source":  "spool_daemon",
+  "ts":      1772984655.162,
+  "ts_iso":  "2026-03-13T02:25:00Z",
+  "step":    "daemon",
+  "status":  "start_failed",
+  "log":     "/srv/exoria/spool.log"
+}
+```
+
+| Champ | Type | Description |
+|-------|------|-------------|
+| `log` | `string` | Chemin du fichier de log (consulter pour la cause) |
+
+---
+
+#### `daemon / stopped`
+Émis après l'arrêt propre du daemon (`./run.sh stop` ou `./run.sh restart`).
+
+```json
+{
+  "source":  "spool_daemon",
+  "ts":      1772984655.162,
+  "ts_iso":  "2026-03-13T02:25:00Z",
+  "step":    "daemon",
+  "status":  "stopped",
+  "pid":     9677
+}
+```
+
+| Champ | Type | Description |
+|-------|------|-------------|
+| `pid` | `int` | PID du processus arrêté |
+
+> **Note :** Si le process résiste au SIGTERM et reçoit un SIGKILL, l'event `stopped` est quand même émis après la fin effective du process.
+
+---
+
+### Séquence lifecycle complète
+
+```
+./run.sh run / restart
+  └─ daemon/started   {pid, log, workers, nas_host}
+
+./run.sh stop / restart
+  └─ daemon/stopped   {pid}
+
+./run.sh run  (crash au démarrage)
+  └─ daemon/start_failed  {log}
+```
+
+---
+
+## Events émis par `spool.py` (`source = "spool_status"`)
+
+> Voir la section suivante — ces events sont émis indépendamment de `run.sh`.
+
+---
+
 # Kafka Events — inspect_session
 
 ## Infra

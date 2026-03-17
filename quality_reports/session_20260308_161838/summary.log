@@ -1,0 +1,14 @@
+========================================
+SESSION: session_20260308_161838
+DATE:    2026-03-17 13:38:29
+DIR:     /Users/christopher/spool/session_20260308_161838
+REPORTS: /Users/christopher/spool/quality_reports/session_20260308_161838
+
+CHECKS:
+  files.sh        PASS
+  sanity.sh       FAIL
+  quality.sh      SKIP
+  verify_naming.py SKIP
+
+RESULT: FAIL
+========================================

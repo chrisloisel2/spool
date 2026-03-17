@@ -1,0 +1,9 @@
+# Check: sanity
+# Session: /Users/christopher/spool/session_20260308_161838
+# Started: 2026-03-17 13:38:28
+
+[OK] Présence des fichiers requise
+[ERROR] La session est marquée failed=true dans metadata.json
+
+# Finished: 2026-03-17 13:38:29
+# Exit code: 1
