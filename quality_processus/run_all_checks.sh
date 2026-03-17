@@ -117,7 +117,9 @@ process_session() {
   if [[ "$files_ok" == "False" ]]; then
     echo -e "  ${RED}FAIL${RESET} files.sh"
     _write_report "$metadata" "$checked_at" "blocked_files" 0 \
-      "$files_result" '{"ok":null}' '{"score_avg":0,"cameras":{}}' 'false' "$(printf '%s\n' "${fixes_applied[@]+"${fixes_applied[@]}"}" | python3 -c 'import sys,json; print(json.dumps([l.rstrip() for l in sys.stdin if l.strip()]))')"
+      "$files_result" '{"ok":null,"errors":[],"checks_passed":[]}' '{"score_avg":0,"cameras":{}}' '{"ok":false,"scores":{}}' \
+      "$(printf '%s\n' "${fixes_applied[@]+"${fixes_applied[@]}"}" | python3 -c 'import sys,json; print(json.dumps([l.rstrip() for l in sys.stdin if l.strip()]))')" \
+      "bad"
     return
   fi
 
@@ -130,7 +132,9 @@ process_session() {
   if [[ "$sanity_ok" == "False" ]]; then
     echo -e "  ${RED}FAIL${RESET} sanity.sh"
     _write_report "$metadata" "$checked_at" "blocked_sanity" 0 \
-      "$files_result" "$sanity_result" '{"score_avg":0,"cameras":{}}' 'false' "$(printf '%s\n' "${fixes_applied[@]+"${fixes_applied[@]}"}" | python3 -c 'import sys,json; print(json.dumps([l.rstrip() for l in sys.stdin if l.strip()]))')"
+      "$files_result" "$sanity_result" '{"score_avg":0,"cameras":{}}' '{"ok":false,"scores":{}}' \
+      "$(printf '%s\n' "${fixes_applied[@]+"${fixes_applied[@]}"}" | python3 -c 'import sys,json; print(json.dumps([l.rstrip() for l in sys.stdin if l.strip()]))')" \
+      "bad"
     return
   fi
 
@@ -190,15 +194,18 @@ import json, sys
 meta_path, checked_at, status, score, \
   files_raw, sanity_raw, quality_raw, naming_raw, fixes_raw, label = sys.argv[1:11]
 
-def load(s):
-    try: return json.loads(s)
-    except: return {}
+def load(s, fallback=None):
+    try:
+        v = json.loads(s)
+        return v if isinstance(v, (dict, list)) else (fallback if fallback is not None else {})
+    except:
+        return fallback if fallback is not None else {}
 
 files   = load(files_raw)
 sanity  = load(sanity_raw)
 quality = load(quality_raw)
 naming  = load(naming_raw)
-fixes   = load(fixes_raw)
+fixes   = load(fixes_raw, fallback=[])
 
 score_f = float(score) if score else 0.0
 
