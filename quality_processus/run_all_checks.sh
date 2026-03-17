@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 
 # Usage: ./run_all_checks.sh [SPOOL_DIR]
-# Pour chaque session_* dans SPOOL_DIR, lance les 4 checks et écrit
-# le score /100 dans metadata.json sous la clé "quality_score".
+# Pour chaque session_* dans SPOOL_DIR :
+#   - lance fix_shit + files + sanity + quality + verify_naming
+#   - écrit un rapport complet dans metadata.json sous la clé "quality_report"
 
 set -euo pipefail
 
@@ -15,12 +16,71 @@ else
   GREEN=''; RED=''; YELLOW=''; RESET=''; BOLD=''
 fi
 
-# Extrait "NOTE FINALE: XX.X / 100" depuis la sortie de quality.sh
-extract_quality_score() {
+# ── Extrait les scores par caméra depuis quality.sh ──────────────────────────
+extract_quality_details() {
   local session_dir="$1"
   local output
-  output="$("$SCRIPT_DIR/quality.sh" "$session_dir" 2>/dev/null)" || { echo "0"; return; }
-  echo "$output" | awk -F': ' '/^NOTE FINALE:/{sum+=$2; n++} END{if(n>0) printf "%.1f", sum/n; else print "0"}'
+  output="$("$SCRIPT_DIR/quality.sh" "$session_dir" 2>/dev/null)" || { echo "{}"; return; }
+
+  echo "$output" | awk '
+    /^VIDEO:/ { cam = $2 }
+    /^NOTE FINALE:/ {
+      split($0, a, ": "); split(a[2], b, " "); scores[cam] = b[1]
+    }
+    /nettete/ {
+      split($0, a, ": "); split(a[2], b, " "); sharp[cam] = b[1]
+    }
+    /exposition/ {
+      split($0, a, ": "); split(a[2], b, " "); expo[cam] = b[1]
+    }
+    /clipping/ {
+      split($0, a, ": "); split(a[2], b, " "); clip[cam] = b[1]
+    }
+    /dynamique/ {
+      split($0, a, ": "); split(a[2], b, " "); motion[cam] = b[1]
+    }
+    END {
+      n = 0; sum = 0
+      for (c in scores) { sum += scores[c]; n++ }
+      avg = (n > 0) ? sum/n : 0
+
+      printf "{\"score_avg\":%.1f", avg
+      printf ",\"cameras\":{"
+      sep = ""
+      for (c in scores) {
+        printf "%s\"%s\":{\"score\":%.1f,\"sharpness\":%.1f,\"exposure\":%.1f,\"clipping\":%.1f,\"motion\":%.1f}", \
+          sep, c, scores[c]+0, sharp[c]+0, expo[c]+0, clip[c]+0, motion[c]+0
+        sep = ","
+      }
+      printf "}}"
+    }
+  '
+}
+
+# ── Collecte les erreurs d'un script avec sortie lisible ─────────────────────
+run_check_capture() {
+  local script="$1"
+  local session_dir="$2"
+  local output exit_code=0
+
+  output="$("$script" "$session_dir" 2>&1)" || exit_code=$?
+
+  local errors=()
+  local oks=()
+  while IFS= read -r line; do
+    [[ "$line" =~ \[ERROR\] ]] && errors+=("${line#*\[ERROR\] }")
+    [[ "$line" =~ \[OK\] ]]    && oks+=("${line#*\[OK\] }")
+  done <<< "$output"
+
+  # Sérialise en JSON inline
+  local errors_json oks_json
+  errors_json="$(printf '%s\n' "${errors[@]+"${errors[@]}"}" | python3 -c \
+    'import sys,json; lines=[l.rstrip() for l in sys.stdin if l.strip()]; print(json.dumps(lines))')"
+  oks_json="$(printf '%s\n' "${oks[@]+"${oks[@]}"}" | python3 -c \
+    'import sys,json; lines=[l.rstrip() for l in sys.stdin if l.strip()]; print(json.dumps(lines))')"
+
+  echo "{\"ok\":$([ $exit_code -eq 0 ] && echo true || echo false),\"errors\":${errors_json},\"checks_passed\":${oks_json}}"
+  return $exit_code
 }
 
 process_session() {
@@ -31,42 +91,65 @@ process_session() {
 
   echo -e "\n${BOLD}$session_name${RESET}"
 
-  # 0. fix_shit.sh — corrections automatiques avant tout check
-  if ! "$SCRIPT_DIR/fix_shit.sh" "$session_dir" >/dev/null 2>&1; then
-    echo -e "  ${YELLOW}WARN${RESET} fix_shit.sh a rencontré une erreur (on continue quand même)"
-  fi
+  local checked_at
+  checked_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-  # Recharger metadata après fix éventuel
+  # ── 0. fix_shit ───────────────────────────────────────────────────────────
+  local fixes_applied=()
+  local fix_output
+  fix_output="$("$SCRIPT_DIR/fix_shit.sh" "$session_dir" 2>&1)" || true
+  while IFS= read -r line; do
+    [[ "$line" =~ \[FIX\] ]] && fixes_applied+=("${line#*\[FIX\]  }")
+  done <<< "$fix_output"
+
   metadata="$session_dir/metadata.json"
-  [[ -f "$metadata" ]] || { echo -e "  ${RED}SKIP${RESET} metadata.json absent même après fix"; return; }
+  if [[ ! -f "$metadata" ]]; then
+    echo -e "  ${RED}SKIP${RESET} metadata.json absent même après fix"
+    return
+  fi
 
-  # 1. files.sh — bloquant
-  if ! "$SCRIPT_DIR/files.sh" "$session_dir" >/dev/null 2>&1; then
+  # ── 1. files.sh ───────────────────────────────────────────────────────────
+  local files_result
+  files_result="$(run_check_capture "$SCRIPT_DIR/files.sh" "$session_dir")" || true
+  local files_ok
+  files_ok="$(echo "$files_result" | python3 -c 'import sys,json; print(json.load(sys.stdin)["ok"])')"
+
+  if [[ "$files_ok" == "False" ]]; then
     echo -e "  ${RED}FAIL${RESET} files.sh"
-    jq '. + {"quality_score": 0, "quality_label": "bad", "quality_checked_at": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}' \
-      "$metadata" > "$metadata.tmp" && mv "$metadata.tmp" "$metadata"
+    _write_report "$metadata" "$checked_at" "blocked_files" 0 \
+      "$files_result" '{"ok":null}' '{"score_avg":0,"cameras":{}}' 'false' "$(printf '%s\n' "${fixes_applied[@]+"${fixes_applied[@]}"}" | python3 -c 'import sys,json; print(json.dumps([l.rstrip() for l in sys.stdin if l.strip()]))')"
     return
   fi
 
-  # 2. sanity.sh — bloquant
-  if ! "$SCRIPT_DIR/sanity.sh" "$session_dir" >/dev/null 2>&1; then
+  # ── 2. sanity.sh ──────────────────────────────────────────────────────────
+  local sanity_result
+  sanity_result="$(run_check_capture "$SCRIPT_DIR/sanity.sh" "$session_dir")" || true
+  local sanity_ok
+  sanity_ok="$(echo "$sanity_result" | python3 -c 'import sys,json; print(json.load(sys.stdin)["ok"])')"
+
+  if [[ "$sanity_ok" == "False" ]]; then
     echo -e "  ${RED}FAIL${RESET} sanity.sh"
-    jq '. + {"quality_score": 0, "quality_label": "bad", "quality_checked_at": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}' \
-      "$metadata" > "$metadata.tmp" && mv "$metadata.tmp" "$metadata"
+    _write_report "$metadata" "$checked_at" "blocked_sanity" 0 \
+      "$files_result" "$sanity_result" '{"score_avg":0,"cameras":{}}' 'false' "$(printf '%s\n' "${fixes_applied[@]+"${fixes_applied[@]}"}" | python3 -c 'import sys,json; print(json.dumps([l.rstrip() for l in sys.stdin if l.strip()]))')"
     return
   fi
 
-  # 3. quality.sh — score /100
+  # ── 3. quality.sh ─────────────────────────────────────────────────────────
+  local quality_details
+  quality_details="$(extract_quality_details "$session_dir")"
   local score
-  score="$(extract_quality_score "$session_dir")"
+  score="$(echo "$quality_details" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("score_avg",0))')"
 
-  # 4. verify_naming.sh — pénalité si échec
-  local naming_ok=true
-  bash "$SCRIPT_DIR/verify_naming.sh" "$session_dir" >/dev/null 2>&1 || naming_ok=false
+  # ── 4. verify_naming.sh ───────────────────────────────────────────────────
+  local naming_result naming_ok
+  naming_result="$(python3 "$SCRIPT_DIR/verify_naming.sh" "$session_dir" 2>/dev/null \
+    | python3 -c 'import sys,json; d=json.load(sys.stdin); r=d.get("result",{}); ok=all(v>=0.60 for v in r.values()); print(json.dumps({"ok":ok,"scores":r}))' \
+    2>/dev/null)" || naming_result='{"ok":false,"scores":{}}'
+  naming_ok="$(echo "$naming_result" | python3 -c 'import sys,json; print(json.load(sys.stdin)["ok"])')"
 
-  # Calcul label
+  # ── Label final ───────────────────────────────────────────────────────────
   local label
-  if [[ "$naming_ok" == "false" ]] || awk "BEGIN{exit !($score < 60)}"; then
+  if [[ "$naming_ok" == "False" ]] || awk "BEGIN{exit !($score < 60)}"; then
     label="bad"
   elif awk "BEGIN{exit !($score < 75)}"; then
     label="acceptable"
@@ -76,17 +159,94 @@ process_session() {
     label="perfect"
   fi
 
-  # Écriture dans metadata.json
-  jq --argjson score "$score" \
-     --arg label "$label" \
-     --arg checked_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-     '. + {quality_score: $score, quality_label: $label, quality_checked_at: $checked_at}' \
-     "$metadata" > "$metadata.tmp" && mv "$metadata.tmp" "$metadata"
+  local fixes_json
+  fixes_json="$(printf '%s\n' "${fixes_applied[@]+"${fixes_applied[@]}"}" | python3 -c \
+    'import sys,json; print(json.dumps([l.rstrip() for l in sys.stdin if l.strip()]))')"
+
+  _write_report "$metadata" "$checked_at" "ok" "$score" \
+    "$files_result" "$sanity_result" "$quality_details" "$naming_result" "$fixes_json" "$label"
 
   echo -e "  score: ${BOLD}$score / 100${RESET}  label: ${BOLD}$label${RESET}"
 }
 
-# Découverte des sessions
+# ── Écrit le bloc quality_report dans metadata.json ──────────────────────────
+_write_report() {
+  local metadata="$1"
+  local checked_at="$2"
+  local status="$3"
+  local score="$4"
+  local files_result="$5"
+  local sanity_result="$6"
+  local quality_details="$7"
+  local naming_result="$8"
+  local fixes_json="$9"
+  local label="${10:-bad}"
+
+  python3 - "$metadata" "$checked_at" "$status" "$score" \
+    "$files_result" "$sanity_result" "$quality_details" "$naming_result" "$fixes_json" "$label" \
+  <<'PYEOF'
+import json, sys
+
+meta_path, checked_at, status, score, \
+  files_raw, sanity_raw, quality_raw, naming_raw, fixes_raw, label = sys.argv[1:11]
+
+def load(s):
+    try: return json.loads(s)
+    except: return {}
+
+files   = load(files_raw)
+sanity  = load(sanity_raw)
+quality = load(quality_raw)
+naming  = load(naming_raw)
+fixes   = load(fixes_raw)
+
+score_f = float(score) if score else 0.0
+
+report = {
+    "status":       status,
+    "score":        score_f,
+    "label":        label,
+    "checked_at":   checked_at,
+    "fixes_applied": fixes if isinstance(fixes, list) else [],
+    "checks": {
+        "files": {
+            "passed": files.get("ok", False),
+            "checks_passed": files.get("checks_passed", []),
+            "errors": files.get("errors", []),
+        },
+        "sanity": {
+            "passed": sanity.get("ok", False),
+            "checks_passed": sanity.get("checks_passed", []),
+            "errors": sanity.get("errors", []),
+        },
+        "quality": {
+            "score_avg": quality.get("score_avg", 0),
+            "cameras":   quality.get("cameras", {}),
+        },
+        "naming": {
+            "passed": naming.get("ok", False),
+            "scores": naming.get("scores", {}),
+        },
+    },
+}
+
+with open(meta_path) as f:
+    meta = json.load(f)
+
+meta["quality_score"]      = score_f
+meta["quality_label"]      = label
+meta["quality_checked_at"] = checked_at
+meta["quality_report"]     = report
+
+with open(meta_path + ".tmp", "w") as f:
+    json.dump(meta, f, indent=2, ensure_ascii=False)
+
+import os
+os.replace(meta_path + ".tmp", meta_path)
+PYEOF
+}
+
+# ── Découverte des sessions ───────────────────────────────────────────────────
 sessions=()
 while IFS= read -r s; do sessions+=("$s"); done \
   < <(find "$SPOOL_DIR" -maxdepth 1 -type d -name 'session_*' | sort)

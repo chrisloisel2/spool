@@ -67,7 +67,56 @@
   "end_time": "2026-03-08T15:18:58.812008+00:00",
   "duration_seconds": 20.256521300001623,
   "failed": false,
-  "quality_score": 0,
+  "quality_score": 0.0,
   "quality_label": "bad",
-  "quality_checked_at": "2026-03-17T11:36:43Z"
+  "quality_checked_at": "2026-03-17T11:39:54Z",
+  "quality_report": {
+    "status": "ok",
+    "score": 0.0,
+    "label": "bad",
+    "checked_at": "2026-03-17T11:39:54Z",
+    "fixes_applied": [],
+    "checks": {
+      "files": {
+        "passed": true,
+        "checks_passed": [
+          "All required files are present"
+        ],
+        "errors": []
+      },
+      "sanity": {
+        "passed": true,
+        "checks_passed": [
+          "Présence des fichiers requise",
+          "metadata.json cohérent",
+          "head.mp4 lisible (1920x1200)",
+          "head.jsonl valide",
+          "head: frames cohérentes (jsonl=478, mp4=544)",
+          "left.mp4 lisible (1920x1200)",
+          "left.jsonl valide",
+          "left: frames cohérentes (jsonl=478, mp4=544)",
+          "right.mp4 lisible (1920x1200)",
+          "right.jsonl valide",
+          "right: frames cohérentes (jsonl=478, mp4=544)",
+          "Toutes les vidéos ont le même nombre de frames",
+          "tracker_positions.csv valide et les 3 trackers sont présents",
+          "/Users/christopher/spool/session_20260308_161838/gripper_left_data.csv valide",
+          "/Users/christopher/spool/session_20260308_161838/gripper_right_data.csv valide"
+        ],
+        "errors": []
+      },
+      "quality": {
+        "score_avg": 0,
+        "cameras": {}
+      },
+      "naming": {
+        "passed": false,
+        "scores": {
+          "head_name_is_correct": 0.1501345785580705,
+          "left_name_is_correct": 0.31871583397635983,
+          "right_name_is_correct": 0.44307434079171104
+        }
+      }
+    }
+  }
 }
