@@ -31,7 +31,14 @@ process_session() {
 
   echo -e "\n${BOLD}$session_name${RESET}"
 
-  [[ -f "$metadata" ]] || { echo -e "  ${RED}SKIP${RESET} metadata.json absent"; return; }
+  # 0. fix_shit.sh — corrections automatiques avant tout check
+  if ! "$SCRIPT_DIR/fix_shit.sh" "$session_dir" >/dev/null 2>&1; then
+    echo -e "  ${YELLOW}WARN${RESET} fix_shit.sh a rencontré une erreur (on continue quand même)"
+  fi
+
+  # Recharger metadata après fix éventuel
+  metadata="$session_dir/metadata.json"
+  [[ -f "$metadata" ]] || { echo -e "  ${RED}SKIP${RESET} metadata.json absent même après fix"; return; }
 
   # 1. files.sh — bloquant
   if ! "$SCRIPT_DIR/files.sh" "$session_dir" >/dev/null 2>&1; then

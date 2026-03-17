@@ -250,9 +250,15 @@ process_session() {
 # ─────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────
+
+# Détecte si l'argument est une session directe ou un spool dir
 sessions=()
-while IFS= read -r s; do sessions+=("$s"); done \
-  < <(find "$SPOOL_DIR" -maxdepth 1 -type d -name 'session_*' | sort)
+if [[ "$(basename "$SPOOL_DIR")" == session_* && -d "$SPOOL_DIR" ]]; then
+  sessions+=("$SPOOL_DIR")
+else
+  while IFS= read -r s; do sessions+=("$s"); done \
+    < <(find "$SPOOL_DIR" -maxdepth 1 -type d -name 'session_*' | sort)
+fi
 
 if [[ ${#sessions[@]} -eq 0 ]]; then
   echo "Aucune session trouvée dans $SPOOL_DIR"
