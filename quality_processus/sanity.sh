@@ -133,51 +133,87 @@ check_jsonl() {
   awk -v cam="$cam" '
     BEGIN {
       prev_idx = 0
-      prev_ts = -1
-      line_no = 0
+      prev_ts  = -1
+      line_no  = 0
+      fmt      = ""
     }
+
+    function extract(line, key,    val, i) {
+      i = index(line, "\"" key "\"")
+      if (i == 0) return ""
+      val = substr(line, i + length(key) + 2)
+      sub(/^[[:space:]]*:[[:space:]]*/, "", val)
+      sub(/[[:space:]]*[,}].*/, "", val)
+      return val
+    }
+
     {
       line_no++
-      if ($0 !~ /"index"[[:space:]]*:/) {
-        printf("[ERROR] %s.jsonl ligne %d: champ index absent\n", cam, line_no) > "/dev/stderr"
-        exit 1
+
+      # Détection du format sur la première ligne
+      if (line_no == 1) {
+        if ($0 ~ /"index"[[:space:]]*:/)        fmt = "v1"
+        else if ($0 ~ /"frame"[[:space:]]*:/)   fmt = "v2"
+        else {
+          printf("[ERROR] %s.jsonl ligne 1: format non reconnu (ni index ni frame)\n", cam) > "/dev/stderr"
+          exit 1
+        }
       }
-      if ($0 !~ /"capture_time"[[:space:]]*:/) {
-        printf("[ERROR] %s.jsonl ligne %d: champ capture_time absent\n", cam, line_no) > "/dev/stderr"
-        exit 1
+
+      # Extraction selon le format détecté
+      if (fmt == "v1") {
+        idx = extract($0, "index")
+        ts  = extract($0, "capture_time")
+        if (idx == "") {
+          printf("[ERROR] %s.jsonl ligne %d: champ index absent\n", cam, line_no) > "/dev/stderr"
+          exit 1
+        }
+        if (ts == "") {
+          printf("[ERROR] %s.jsonl ligne %d: champ capture_time absent\n", cam, line_no) > "/dev/stderr"
+          exit 1
+        }
+        if (ts !~ /^[0-9]+$/) {
+          printf("[ERROR] %s.jsonl ligne %d: capture_time invalide (%s)\n", cam, line_no, ts) > "/dev/stderr"
+          exit 1
+        }
+        if (prev_ts >= 0 && ts+0 <= prev_ts+0) {
+          printf("[ERROR] %s.jsonl ligne %d: capture_time non croissant (%s <= %s)\n", cam, line_no, ts, prev_ts) > "/dev/stderr"
+          exit 1
+        }
+      } else {
+        idx = extract($0, "frame")
+        ts  = extract($0, "wall")
+        if (idx == "") {
+          printf("[ERROR] %s.jsonl ligne %d: champ frame absent\n", cam, line_no) > "/dev/stderr"
+          exit 1
+        }
+        if (ts == "") {
+          printf("[ERROR] %s.jsonl ligne %d: champ wall absent\n", cam, line_no) > "/dev/stderr"
+          exit 1
+        }
+        if (ts !~ /^[0-9]+(\.[0-9]+)?$/) {
+          printf("[ERROR] %s.jsonl ligne %d: wall invalide (%s)\n", cam, line_no, ts) > "/dev/stderr"
+          exit 1
+        }
+        if (prev_ts >= 0 && ts+0 <= prev_ts+0) {
+          printf("[ERROR] %s.jsonl ligne %d: wall non croissant (%s <= %s)\n", cam, line_no, ts, prev_ts) > "/dev/stderr"
+          exit 1
+        }
       }
-
-      idx = $0
-      ts  = $0
-
-      sub(/.*"index"[[:space:]]*:[[:space:]]*/, "", idx)
-      sub(/[[:space:]]*,.*/, "", idx)
-
-      sub(/.*"capture_time"[[:space:]]*:[[:space:]]*/, "", ts)
-      sub(/[[:space:]]*}.*/, "", ts)
 
       if (idx !~ /^[0-9]+$/) {
         printf("[ERROR] %s.jsonl ligne %d: index invalide (%s)\n", cam, line_no, idx) > "/dev/stderr"
         exit 1
       }
-      if (ts !~ /^[0-9]+$/) {
-        printf("[ERROR] %s.jsonl ligne %d: capture_time invalide (%s)\n", cam, line_no, ts) > "/dev/stderr"
-        exit 1
-      }
 
       expected = prev_idx + 1
-      if (idx != expected) {
+      if (idx+0 != expected) {
         printf("[ERROR] %s.jsonl ligne %d: index attendu=%d trouvé=%d\n", cam, line_no, expected, idx) > "/dev/stderr"
         exit 1
       }
 
-      if (prev_ts >= 0 && ts <= prev_ts) {
-        printf("[ERROR] %s.jsonl ligne %d: capture_time non strictement croissant (%s <= %s)\n", cam, line_no, ts, prev_ts) > "/dev/stderr"
-        exit 1
-      }
-
-      prev_idx = idx
-      prev_ts = ts
+      prev_idx = idx+0
+      prev_ts  = ts+0
     }
     END {
       if (line_no == 0) {
