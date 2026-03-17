@@ -223,6 +223,73 @@ PYEOF
 }
 
 # ─────────────────────────────────────────────
+# 3. FIX GRIPPER CSV : pince1/pince2 → gripper_right/gripper_left
+#    Convention : pince1 = right, pince2 = left
+# ─────────────────────────────────────────────
+fix_gripper_names() {
+  local session_dir="$1"
+
+  local pince1="$session_dir/pince1_data.csv"
+  local pince2="$session_dir/pince2_data.csv"
+  local dest_right="$session_dir/gripper_right_data.csv"
+  local dest_left="$session_dir/gripper_left_data.csv"
+
+  if [[ -f "$pince1" && ! -f "$dest_right" ]]; then
+    cp "$pince1" "${pince1}.bak"
+    mv "$pince1" "$dest_right"
+    log_ok "pince1_data.csv → gripper_right_data.csv"
+    (( fixed_total++ )) || true
+  elif [[ -f "$pince1" && -f "$dest_right" ]]; then
+    log_warn "pince1_data.csv existe mais gripper_right_data.csv aussi — skip renommage"
+  fi
+
+  if [[ -f "$pince2" && ! -f "$dest_left" ]]; then
+    cp "$pince2" "${pince2}.bak"
+    mv "$pince2" "$dest_left"
+    log_ok "pince2_data.csv → gripper_left_data.csv"
+    (( fixed_total++ )) || true
+  elif [[ -f "$pince2" && -f "$dest_left" ]]; then
+    log_warn "pince2_data.csv existe mais gripper_left_data.csv aussi — skip renommage"
+  fi
+}
+
+# ─────────────────────────────────────────────
+# 4. FIX TRACKER CSV : renommer tracker_1/2/3 → tracker_head/left/right
+#    Convention : tracker_1 = head, tracker_2 = left, tracker_3 = right
+# ─────────────────────────────────────────────
+fix_tracker_header() {
+  local session_dir="$1"
+  local file="$session_dir/tracker_positions.csv"
+
+  [[ -f "$file" ]] || { log_warn "tracker_positions.csv absent"; return; }
+
+  local header
+  header="$(head -n1 "$file" | tr -d '\r')"
+
+  # Détecter si le header utilise tracker_1/2/3 au lieu de tracker_head/left/right
+  if ! echo "$header" | grep -q "tracker_head_x"; then
+    if echo "$header" | grep -q "tracker_1_x"; then
+      cp "$file" "${file}.bak"
+      if [[ "$(uname)" == "Darwin" ]]; then
+        sed -i '' '1s/tracker_1_/tracker_head_/g;
+                   1s/tracker_2_/tracker_left_/g;
+                   1s/tracker_3_/tracker_right_/g' "$file"
+      else
+        sed -i '1s/tracker_1_/tracker_head_/g;
+                1s/tracker_2_/tracker_left_/g;
+                1s/tracker_3_/tracker_right_/g' "$file"
+      fi
+      log_ok "tracker_positions.csv : header tracker_1/2/3 → tracker_head/left/right"
+      (( fixed_total++ )) || true
+    else
+      log_warn "tracker_positions.csv : header non reconnu — $(echo "$header" | cut -c1-80)"
+    fi
+  else
+    log_info "tracker_positions.csv header OK"
+  fi
+}
+
+# ─────────────────────────────────────────────
 # Traitement d'une session
 # ─────────────────────────────────────────────
 process_session() {
@@ -245,6 +312,12 @@ process_session() {
   else
     log_warn "Répertoire videos/ absent — JSONL non vérifiés"
   fi
+
+  # Fix 3 : renommage pince1/2 → gripper_right/left
+  fix_gripper_names "$session_dir" || true
+
+  # Fix 4 : header tracker_positions.csv tracker_1/2/3 → head/left/right
+  fix_tracker_header "$session_dir" || true
 }
 
 # ─────────────────────────────────────────────
