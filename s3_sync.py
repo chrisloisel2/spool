@@ -17,6 +17,7 @@ import os
 import sys
 import time
 import json
+import socket
 import logging
 import argparse
 import hashlib
@@ -50,6 +51,8 @@ UPLOAD_WORKERS      = 4       # threads parallèles pour l'upload des fichiers
 
 KAFKA_BROKER        = "192.168.88.4:9092"
 KAFKA_TOPIC         = "monitoring"
+HEARTBEAT_INTERVAL  = 30      # secondes entre deux heartbeats serveur
+SERVER_ID           = os.environ.get("SERVER_ID", "spool-server-01")
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -105,6 +108,71 @@ def kafka_emit(**fields):
         global _kafka_producer
         with _kafka_lock:
             _kafka_producer = None
+
+
+# ── Heartbeat serveur ─────────────────────────────────────────────────────────
+
+def _disk_info(path: str) -> dict:
+    try:
+        st = os.statvfs(path)
+        total = st.f_frsize * st.f_blocks
+        free  = st.f_frsize * st.f_bavail
+        used  = total - free
+        return {
+            "total_gb": round(total / 1e9, 1),
+            "free_gb":  round(free  / 1e9, 1),
+            "used_pct": round(used / total * 100, 1) if total > 0 else 0.0,
+        }
+    except Exception:
+        return {"total_gb": 0.0, "free_gb": 0.0, "used_pct": 0.0}
+
+
+def emit_heartbeat(watcher: "S3SyncWatcher"):
+    """Émet un heartbeat server_heartbeat sur Kafka."""
+    try:
+        entries = [
+            e for e in os.listdir(watcher.inbox)
+            if e.startswith("session_") and
+            os.path.isdir(os.path.join(watcher.inbox, e))
+        ]
+    except Exception:
+        entries = []
+
+    with watcher._lock:
+        done_count     = len(watcher._done)
+        fail_count     = len(watcher._fail)
+        uploading_count = len(watcher._uploading)
+
+    total    = len(entries)
+    pending  = total - done_count - fail_count - uploading_count
+    pending  = max(pending, 0)
+
+    disk = _disk_info(watcher.inbox)
+
+    kafka_emit(
+        source           = "server_heartbeat",
+        server_id        = SERVER_ID,
+        hostname         = socket.gethostname(),
+
+        inbox_dir             = watcher.inbox,
+        inbox_sessions_total  = total,
+        inbox_sessions_pending    = pending,
+        inbox_sessions_uploading  = uploading_count,
+        inbox_sessions_done       = done_count,
+        inbox_sessions_failed     = fail_count,
+
+        disk_inbox_free_gb  = disk["free_gb"],
+        disk_inbox_total_gb = disk["total_gb"],
+        disk_inbox_used_pct = disk["used_pct"],
+
+        s3_sync_active = True,
+        s3_bucket      = watcher.bucket,
+        s3_prefix      = watcher.prefix,
+        dry_run        = watcher.dry_run,
+
+        kafka_ok  = HAS_KAFKA,
+        uptime_s  = round(time.time() - watcher._start_time, 1),
+    )
 
 
 # ── S3 ────────────────────────────────────────────────────────────────────────
@@ -252,10 +320,12 @@ class S3SyncWatcher:
         self.dry_run      = dry_run
         self.delete_after = delete_after
 
-        self._done:  set[str] = set()   # sessions déjà uploadées
-        self._fail:  set[str] = set()   # sessions en erreur (ne pas retenter)
-        self._lock   = threading.Lock()
-        self._pool   = ThreadPoolExecutor(max_workers=2)  # sessions en parallèle
+        self._done:      set[str] = set()   # sessions uploadées avec succès
+        self._fail:      set[str] = set()   # sessions en erreur
+        self._uploading: set[str] = set()   # sessions en cours d'upload
+        self._lock       = threading.Lock()
+        self._pool       = ThreadPoolExecutor(max_workers=2)
+        self._start_time = time.time()
 
     def _scan(self):
         try:
@@ -279,9 +349,8 @@ class S3SyncWatcher:
                 log.debug("[%s] Pas encore stable, attente…", name)
                 continue
 
-            # Marquer comme en cours pour ne pas relancer deux fois
             with self._lock:
-                self._done.add(name)  # réservé — on retire si fail
+                self._uploading.add(name)
 
             log.info("[%s] Session stable → lancement upload", name)
             self._pool.submit(self._handle_session, name, session_dir)
@@ -296,15 +365,25 @@ class S3SyncWatcher:
                 self.dry_run,
                 self.delete_after,
             )
-            if not ok:
-                with self._lock:
-                    self._done.discard(name)
+            with self._lock:
+                self._uploading.discard(name)
+                if ok:
+                    self._done.add(name)
+                else:
                     self._fail.add(name)
         except Exception as e:
             log.error("[%s] Exception : %s", name, e)
             with self._lock:
-                self._done.discard(name)
+                self._uploading.discard(name)
                 self._fail.add(name)
+
+    def _heartbeat_loop(self):
+        while True:
+            try:
+                emit_heartbeat(self)
+            except Exception as e:
+                log.warning("Heartbeat échoué : %s", e)
+            time.sleep(HEARTBEAT_INTERVAL)
 
     def run(self):
         log.info("Démarrage — inbox=%s  bucket=s3://%s/%s  stable=%ds  interval=%ds",
@@ -313,6 +392,10 @@ class S3SyncWatcher:
             log.info("[DRY-RUN] Aucun fichier ne sera uploadé ni supprimé")
         kafka_emit(step="daemon", status="started",
                    inbox=self.inbox, bucket=self.bucket, prefix=self.prefix)
+
+        hb = threading.Thread(target=self._heartbeat_loop, daemon=True, name="heartbeat")
+        hb.start()
+        log.info("Heartbeat démarré (toutes les %ds)", HEARTBEAT_INTERVAL)
 
         while True:
             self._scan()
