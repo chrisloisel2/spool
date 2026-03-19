@@ -1266,6 +1266,12 @@ class Scanner(threading.Thread):
                 jid = uuid.uuid4().hex
                 dst = os.path.join(SPOOL_DIR, name)
 
+                # Si le dossier destination existe déjà (résidu d'un crash),
+                # on le supprime — la DB n'a pas d'entrée pour lui (vérifié plus haut).
+                if os.path.exists(dst):
+                    shutil.rmtree(dst)
+                    log.warning("[Scanner] Résidu supprimé dans spool/ : %s", dst)
+
                 shutil.move(session_dir, dst)
                 size_bytes, file_count = self._dir_size_and_count(dst)
 
@@ -1458,9 +1464,10 @@ class Worker(threading.Thread):
             if DELETE_LOCAL_AFTER_SUCCESS:
                 try:
                     shutil.rmtree(session_dir)
-                    log.debug("[JOB %s] Dossier local supprimé.", jid[:8])
+                    log.info("[JOB %s] Dossier local supprimé : %s", jid[:8], session_dir)
+                    tui_log(f"DELETED {session_id}")
                 except Exception as ce:
-                    log.warning("[JOB %s] Suppression locale échouée : %s", jid[:8], ce)
+                    log.warning("[JOB %s] Suppression locale échouée : %s — %s", jid[:8], session_dir, ce)
 
         except Exception as e:
             err = str(e)
