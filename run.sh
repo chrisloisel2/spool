@@ -7,7 +7,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SPOOL_PY="${SCRIPT_DIR}/spool.py"
 PYTHON="$(command -v python3)"
-LOG_FILE="/srv/exoria/spool.log"
+LOG_FILE="/srv/exoria/logs/spool.log"
 PID_FILE="/tmp/spool_daemon.pid"
 
 KAFKA_BROKER="192.168.88.4:9092"

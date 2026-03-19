@@ -75,6 +75,31 @@ SFTP_MAX_PACKET   = 65536        # 64 KB — paquet SFTP max
 SFTP_READ_BUFFER  = 8388608      # TURBO: 8 MB — buffer lecture locale (x2)
 
 # =========================
+# CONFIG QUALITY CHECKS
+# =========================
+
+# Chemin vers le dossier quality_processus/ (relatif au script ou absolu)
+QUALITY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "quality_processus")
+
+# Timeouts (secondes) par étape — les vidéos lourdes peuvent prendre du temps
+QUALITY_TIMEOUT_FIX     = 60
+QUALITY_TIMEOUT_FILES   = 30
+QUALITY_TIMEOUT_SANITY  = 120   # ffprobe sur 3 vidéos
+QUALITY_TIMEOUT_QUALITY = 300   # ffmpeg blurdetect — le plus long
+QUALITY_TIMEOUT_NAMING  = 120   # OpenCV verify_naming
+
+# Seuil de score qualité minimum pour accepter la session (0–100)
+QUALITY_SCORE_MIN = 40
+
+# Seuil de certitude nommage (0.0–1.0)
+QUALITY_NAMING_MIN = 0.50
+
+# Active/désactive les étapes optionnelles (fixes si False = skip silencieux)
+QUALITY_RUN_FIX     = True   # tente de réparer les petits problèmes avant checks
+QUALITY_RUN_QUALITY = True   # score vidéo ffmpeg (lent)
+QUALITY_RUN_NAMING  = True   # verify_naming OpenCV (lent)
+
+# =========================
 # CONFIG KAFKA
 # =========================
 
@@ -93,7 +118,10 @@ except ImportError:
 # LOG (maximum)
 # =========================
 
-LOG_FILE = "/srv/exoria/spool.log"
+LOG_DIR  = "/srv/exoria/logs"
+LOG_FILE = os.path.join(LOG_DIR, "spool.log")
+
+os.makedirs(LOG_DIR, exist_ok=True)
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -932,6 +960,207 @@ class NASClient:
         return final
 
 # =========================
+# QUALITY CHECKER
+# =========================
+
+class QualityResult:
+    """Résultat d'un quality check sur une session."""
+    def __init__(self, passed: bool, label: str, score: float, errors: list, details: dict):
+        self.passed  = passed
+        self.label   = label    # "ok" | "blocked_files" | "blocked_sanity" | "low_quality" | "bad_naming"
+        self.score   = score    # 0–100 (score vidéo moyen)
+        self.errors  = errors   # liste de strings d'erreur
+        self.details = details  # dict JSON-serialisable
+
+    def __repr__(self):
+        return f"QualityResult(passed={self.passed}, label={self.label!r}, score={self.score:.1f})"
+
+
+class QualityChecker:
+    """
+    Encapsule les 4 étapes du pipeline qualité :
+      0. fix_shit.sh  — corrections auto (JSONL tronqué, metadata manquant, …)
+      1. files.sh     — présence de tous les fichiers requis
+      2. sanity.sh    — cohérence metadata.json + streams vidéo + CSV
+      3. quality.sh   — score visuel /100 (ffmpeg blurdetect + signalstats)
+      4. verify_naming.sh (py) — vérification nommage caméras via OpenCV
+
+    Chaque étape est optionnelle via QUALITY_RUN_*.
+    Un échec de files ou sanity est bloquant (session → quarantaine).
+    Un score quality < QUALITY_SCORE_MIN ou un naming < QUALITY_NAMING_MIN
+    est également bloquant.
+    """
+
+    def __init__(self):
+        self._fix_script     = os.path.join(QUALITY_DIR, "fix_shit.sh")
+        self._files_script   = os.path.join(QUALITY_DIR, "files.sh")
+        self._sanity_script  = os.path.join(QUALITY_DIR, "sanity.sh")
+        self._quality_script = os.path.join(QUALITY_DIR, "quality.sh")
+        self._naming_script  = os.path.join(QUALITY_DIR, "verify_naming.sh")
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _run(self, cmd: list, timeout: int) -> tuple[int, str, str]:
+        """Lance un sous-processus, retourne (returncode, stdout, stderr)."""
+        try:
+            proc = __import__("subprocess").run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            return proc.returncode, proc.stdout, proc.stderr
+        except __import__("subprocess").TimeoutExpired:
+            return -1, "", f"timeout after {timeout}s"
+        except Exception as e:
+            return -1, "", str(e)
+
+    def _run_sh(self, script: str, session_dir: str, timeout: int) -> tuple[bool, list, list]:
+        """
+        Lance un script bash sur session_dir.
+        Retourne (ok, errors[], oks[]).
+        """
+        rc, stdout, stderr = self._run(["bash", script, session_dir], timeout)
+        combined = stdout + "\n" + stderr
+        errors = [l[len("[ERROR] "):].strip() for l in combined.splitlines() if "[ERROR]" in l]
+        oks    = [l[len("[OK] "):].strip()    for l in combined.splitlines() if "[OK]" in l]
+        passed = (rc == 0) and not errors
+        return passed, errors, oks
+
+    # ── étapes ────────────────────────────────────────────────────────────────
+
+    def _step_fix(self, session_dir: str) -> list:
+        """fix_shit.sh — corrections auto, ne bloque jamais."""
+        if not QUALITY_RUN_FIX or not os.path.isfile(self._fix_script):
+            return []
+        _, stdout, stderr = self._run(["bash", self._fix_script, session_dir], QUALITY_TIMEOUT_FIX)
+        combined = stdout + "\n" + stderr
+        fixes = [l[len("[FIX]"):].strip() for l in combined.splitlines() if "[FIX]" in l]
+        if fixes:
+            log.info("[Quality] fixes appliquées : %s", fixes)
+        return fixes
+
+    def _step_files(self, session_dir: str) -> tuple[bool, list]:
+        """files.sh — bloquant."""
+        if not os.path.isfile(self._files_script):
+            log.warning("[Quality] files.sh introuvable, skip")
+            return True, []
+        passed, errors, _ = self._run_sh(self._files_script, session_dir, QUALITY_TIMEOUT_FILES)
+        return passed, errors
+
+    def _step_sanity(self, session_dir: str) -> tuple[bool, list]:
+        """sanity.sh — bloquant."""
+        if not os.path.isfile(self._sanity_script):
+            log.warning("[Quality] sanity.sh introuvable, skip")
+            return True, []
+        rc, stdout, stderr = self._run(["bash", self._sanity_script, session_dir], QUALITY_TIMEOUT_SANITY)
+        combined = stdout + "\n" + stderr
+        errors = [l[len("[ERROR] "):].strip() for l in combined.splitlines() if "[ERROR]" in l]
+        passed = (rc == 0) and "[SUCCESS]" in combined and not errors
+        return passed, errors
+
+    def _step_quality(self, session_dir: str) -> tuple[float, dict]:
+        """quality.sh — score /100 par vidéo. Retourne (score_avg, details)."""
+        if not QUALITY_RUN_QUALITY or not os.path.isfile(self._quality_script):
+            return -1.0, {}
+        rc, stdout, stderr = self._run(["bash", self._quality_script, session_dir], QUALITY_TIMEOUT_QUALITY)
+        combined = stdout + "\n" + stderr
+        # Parser les notes finales : "NOTE FINALE: XX.X / 100"
+        import re as _re
+        scores = {}
+        current_cam = None
+        for line in combined.splitlines():
+            m = _re.match(r"^VIDEO:\s*(\w+)", line)
+            if m:
+                current_cam = m.group(1)
+            m2 = _re.match(r"^NOTE FINALE:\s*([\d.]+)", line)
+            if m2 and current_cam:
+                scores[current_cam] = float(m2.group(1))
+        score_avg = sum(scores.values()) / len(scores) if scores else -1.0
+        return score_avg, {"cameras": scores, "score_avg": score_avg}
+
+    def _step_naming(self, session_dir: str) -> tuple[bool, dict]:
+        """verify_naming.sh (Python) — nommage caméras OpenCV."""
+        if not QUALITY_RUN_NAMING or not os.path.isfile(self._naming_script):
+            return True, {}
+        rc, stdout, stderr = self._run(
+            ["python3", self._naming_script, session_dir],
+            QUALITY_TIMEOUT_NAMING,
+        )
+        if rc != 0:
+            log.warning("[Quality] verify_naming error (rc=%d): %s", rc, stderr[:200])
+            return False, {"error": stderr[:200]}
+        try:
+            report = json.loads(stdout)
+            result = report.get("result", {})
+            ok = all(v >= QUALITY_NAMING_MIN for v in result.values())
+            return ok, result
+        except Exception as e:
+            log.warning("[Quality] verify_naming JSON parse error: %s", e)
+            return False, {"error": str(e)}
+
+    # ── point d'entrée ────────────────────────────────────────────────────────
+
+    def check(self, session_dir: str, session_id: str) -> QualityResult:
+        """
+        Lance le pipeline complet sur session_dir.
+        Retourne un QualityResult avec passed=True si la session peut partir sur le NAS.
+        """
+        log.info("[Quality] Début quality check — session=%s", session_id)
+        all_errors = []
+        details: dict = {}
+
+        # 0. Fix auto
+        fixes = self._step_fix(session_dir)
+        if fixes:
+            details["fixes"] = fixes
+
+        # 1. Files — bloquant
+        files_ok, files_errors = self._step_files(session_dir)
+        details["files"] = {"passed": files_ok, "errors": files_errors}
+        if not files_ok:
+            all_errors += files_errors
+            log.warning("[Quality] BLOCKED files — session=%s errors=%s", session_id, files_errors)
+            KAFKA.emit("quality", "blocked_files", session_id=session_id, errors=files_errors)
+            return QualityResult(False, "blocked_files", 0.0, all_errors, details)
+
+        # 2. Sanity — bloquant
+        sanity_ok, sanity_errors = self._step_sanity(session_dir)
+        details["sanity"] = {"passed": sanity_ok, "errors": sanity_errors}
+        if not sanity_ok:
+            all_errors += sanity_errors
+            log.warning("[Quality] BLOCKED sanity — session=%s errors=%s", session_id, sanity_errors)
+            KAFKA.emit("quality", "blocked_sanity", session_id=session_id, errors=sanity_errors)
+            return QualityResult(False, "blocked_sanity", 0.0, all_errors, details)
+
+        # 3. Quality score (optionnel mais bloquant si score trop bas)
+        score_avg, quality_details = self._step_quality(session_dir)
+        details["quality"] = quality_details
+        if score_avg >= 0 and score_avg < QUALITY_SCORE_MIN:
+            msg = f"score qualité trop bas: {score_avg:.1f} < {QUALITY_SCORE_MIN}"
+            all_errors.append(msg)
+            log.warning("[Quality] BLOCKED low_quality — session=%s %s", session_id, msg)
+            KAFKA.emit("quality", "blocked_low_quality", session_id=session_id, score=score_avg)
+            return QualityResult(False, "low_quality", score_avg, all_errors, details)
+
+        # 4. Naming (optionnel mais bloquant si confusion caméras)
+        naming_ok, naming_details = self._step_naming(session_dir)
+        details["naming"] = naming_details
+        if not naming_ok:
+            msg = "nommage caméras incorrect (verify_naming)"
+            all_errors.append(msg)
+            log.warning("[Quality] BLOCKED bad_naming — session=%s scores=%s", session_id, naming_details)
+            KAFKA.emit("quality", "blocked_bad_naming", session_id=session_id, naming=naming_details)
+            return QualityResult(False, "bad_naming", score_avg, all_errors, details)
+
+        log.info("[Quality] PASSED — session=%s score=%.1f", session_id, score_avg)
+        KAFKA.emit("quality", "passed", session_id=session_id, score=score_avg)
+        return QualityResult(True, "ok", score_avg, [], details)
+
+
+QUALITY_CHECKER = QualityChecker()
+
+# =========================
 # SCANNER
 # =========================
 
@@ -949,9 +1178,6 @@ class Scanner(threading.Thread):
                 log.error("[Scanner] Erreur inattendue : %s\n%s", e, traceback.format_exc())
             time.sleep(SCAN_INTERVAL)
 
-    def _session_ready(self, session_dir: str) -> bool:
-        return True
-
     def _dir_size_and_count(self, path: str):
         total_bytes = 0
         count = 0
@@ -963,6 +1189,19 @@ class Scanner(threading.Thread):
                 except Exception:
                     pass
         return total_bytes, count
+
+    def _quarantine_session(self, session_dir: str, session_id: str, reason: str):
+        """Déplace une session vers la quarantaine locale après échec quality."""
+        try:
+            os.makedirs(QUARANTINE_DIR, exist_ok=True)
+            dst = os.path.join(QUARANTINE_DIR, session_id)
+            if os.path.exists(dst):
+                dst = dst + f"_dup_{int(time.time())}"
+            shutil.move(session_dir, dst)
+            log.warning("[Scanner] Session '%s' mise en quarantaine : %s", session_id, reason)
+            tui_log(f"QUARANTINE {session_id} — {reason}")
+        except Exception as e:
+            log.error("[Scanner] Impossible de mettre en quarantaine '%s' : %s", session_id, e)
 
     def scan(self):
         # Cherche les sous-dossiers directs de inbox/ qui matchent session_YYYYMMDD_HHMMSS
@@ -987,12 +1226,42 @@ class Scanner(threading.Thread):
             if existing:
                 continue
 
-            # Session complète ?
-            if not self._session_ready(session_dir):
-                log.debug("[Scanner] Session pas encore prête : %s", name)
+            # ── Quality check (dans inbox/, avant de déplacer) ──────────────
+            log.info("[Scanner] Quality check en cours : %s", name)
+            tui_log(f"QC {name} …")
+            try:
+                qr = QUALITY_CHECKER.check(session_dir, name)
+            except Exception as e:
+                log.error("[Scanner] Erreur inattendue quality check '%s' : %s\n%s",
+                          name, e, traceback.format_exc())
+                # En cas d'erreur interne du checker, on laisse la session en inbox
+                # pour qu'elle soit retraitée au prochain scan.
                 continue
 
-            # Déplace le dossier entier dans spool/
+            if not qr.passed:
+                log.warning("[Scanner] Quality FAIL %s — label=%s errors=%s",
+                            name, qr.label, qr.errors)
+                tui_log(f"QC FAIL {name} [{qr.label}]")
+                self._quarantine_session(session_dir, name, qr.label)
+                # Enregistre en DB comme 'failed' pour traçabilité
+                jid = uuid.uuid4().hex
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO jobs(id,session_dir,session_id,size_bytes,file_count,"
+                    "status,attempts,last_error,created_at,updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (jid, os.path.join(QUARANTINE_DIR, name), name,
+                     0, 0, "failed", 1,
+                     f"quality:{qr.label}:{'; '.join(qr.errors[:3])}",
+                     now_iso(), now_iso()),
+                )
+                self.conn.commit()
+                REPORTER.inc_failed()
+                tui_inc_failed()
+                continue
+
+            tui_log(f"QC PASS {name} score={qr.score:.0f}")
+
+            # ── Quality OK → déplace dans spool/ et met en queue ────────────
             try:
                 jid = uuid.uuid4().hex
                 dst = os.path.join(SPOOL_DIR, name)
@@ -1007,8 +1276,8 @@ class Scanner(threading.Thread):
                 )
                 self.conn.commit()
 
-                log.info("[Scanner] Session mise en file : %s (%d fichiers, %.1f MB) [job=%s]",
-                         name, file_count, size_bytes / (1024*1024), jid[:8])
+                log.info("[Scanner] Session mise en file : %s (%d fichiers, %.1f MB) score=%.0f [job=%s]",
+                         name, file_count, size_bytes / (1024*1024), qr.score, jid[:8])
 
             except Exception as e:
                 log.error("[Scanner] Impossible d'enregistrer la session '%s' : %s\n%s", name, e, traceback.format_exc())
