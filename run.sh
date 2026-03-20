@@ -241,60 +241,102 @@ def read_log_raw(n_bytes=LOG_TAIL_BYTES):
     except Exception as e:
         return [f"[erreur log: {e}]"]
 
-def parse_worker_states(lines):
-    """Extrait l'état des workers NAS depuis le log."""
-    workers = {}
-    pat  = re.compile(r'\[JOB ([0-9a-f]+)\]\s+(\d+)/(\d+)\s+\'([^\']+)\'\s+@\s+([\d.]+)\s+MB/s')
-    pat2 = re.compile(r"\[JOB ([0-9a-f]+)\] Session '([^']+)'")
+def parse_log(lines):
+    """
+    Parse le log et retourne:
+    - worker_state[worker_idx] : état courant de chaque worker 1..16
+    - scanner_state            : état courant du scanner
+    - recent_events            : derniers événements notables
+    """
+    # worker-N dans le thread name
+    pat_thread = re.compile(r'\d{4}-\d{2}-\d{2} (\d{2}:\d{2}:\d{2}),\d+ \S+ (\S+) (.*)')
+    pat_job_prog = re.compile(r'\[JOB ([0-9a-f]+)\] (\d+)/(\d+) \'([^\']+)\' @ ([\d.]+) MB/s')
+    pat_job_start = re.compile(r"\[JOB ([0-9a-f]+)\] Session '([^']+)' — (\d+) fichiers")
+    pat_job_done  = re.compile(r"\[JOB ([0-9a-f]+)\] Session '([^']+)' envoyée en ([\d.]+)s @ ([\d.]+) MB/s")
+    pat_job_fail  = re.compile(r"\[JOB ([0-9a-f]+)\] Echec tentative (\d+)/(\d+)")
+    pat_qc        = re.compile(r"\[Scanner\] Quality check en cours : (\S+)")
+    pat_qc_pass   = re.compile(r"\[Quality\] PASSED — session=(\S+) score=([\d.]+)")
+    pat_qc_fail   = re.compile(r"\[Quality\] BLOCKED (\S+) — session=(\S+)")
+    pat_qnas      = re.compile(r"\[Quarantine\] '([^']+)' → NAS OK")
+    pat_qnas_fail = re.compile(r"\[Quarantine\] NAS échouée '([^']+)'")
+
+    # jid → session_id mapping
+    jid_to_sid = {}
+    # worker name → idx
+    w_name_idx = {f"worker-{i}": i for i in range(1, 17)}
+
+    workers = {i: {"status": "idle", "session": "", "files_done": 0, "file_count": 0,
+                   "speed": 0.0, "pct": 0.0, "file": "", "ts": ""} for i in range(1, 17)}
+    scanner = {"status": "idle", "session": "", "qc_done": 0, "qc_fail": 0, "ts": ""}
+    events  = []
+
     for line in lines:
-        m = pat.search(line)
-        if m:
-            jid, done, total, fname, spd = m.group(1), int(m.group(2)), int(m.group(3)), m.group(4), float(m.group(5))
-            workers[jid] = {"files_done": done, "file_count": total, "current_file": fname, "speed_mbps": spd}
-    for line in lines:
-        m = pat2.search(line)
-        if m:
-            jid, sid = m.group(1), m.group(2)
-            if jid in workers:
-                workers[jid]["session_id"] = sid
-    result = {}
-    for jid, w in workers.items():
-        sid = w.get("session_id", jid[:8])
-        result[sid] = w
-    return result
+        m = pat_thread.match(line)
+        if not m:
+            continue
+        ts, tname, msg = m.group(1), m.group(2), m.group(3)
 
-def read_log_speed(lines):
-    pat = re.compile(r'\[JOB ([0-9a-f]+)\].*@\s+([\d.]+)\s+MB/s')
-    last_speed = {}
-    for line in reversed(lines):
-        m = pat.search(line)
-        if m:
-            jid, spd = m.group(1), float(m.group(2))
-            if jid not in last_speed:
-                last_speed[jid] = spd
-        if len(last_speed) >= WORKERS:
-            break
-    return sum(last_speed.values()) if last_speed else 0.0
+        # ── worker NAS ───────────────────────────────────────────────────────
+        widx = w_name_idx.get(tname)
+        if widx:
+            w = workers[widx]
+            m2 = pat_job_start.search(msg)
+            if m2:
+                jid_to_sid[m2.group(1)] = m2.group(2)
+                w.update(status="upload", session=m2.group(2),
+                         file_count=int(m2.group(3)), files_done=0,
+                         speed=0.0, pct=0.0, file="", ts=ts)
+            m2 = pat_job_prog.search(msg)
+            if m2:
+                jid = m2.group(1)
+                sid = jid_to_sid.get(jid, w["session"])
+                fd, ft, fname, spd = int(m2.group(2)), int(m2.group(3)), m2.group(4), float(m2.group(5))
+                pct = fd / max(ft, 1) * 100
+                w.update(status="upload", session=sid, files_done=fd,
+                         file_count=ft, speed=spd, pct=pct,
+                         file=os.path.basename(fname), ts=ts)
+            m2 = pat_job_done.search(msg)
+            if m2:
+                sid, spd = m2.group(2), float(m2.group(4))
+                w.update(status="idle", session="", files_done=0,
+                         file_count=0, speed=0.0, pct=0.0, file="", ts=ts)
+                events.append((ts, "done", f"✓ {sid[-22:]}  {spd:.1f} MB/s"))
+            m2 = pat_job_fail.search(msg)
+            if m2:
+                att, mx = m2.group(2), m2.group(3)
+                w.update(status="retry", ts=ts)
+                if att == mx:
+                    events.append((ts, "err", f"✗ fail {w['session'][-22:]}"))
 
-def parse_scanner_activity(lines):
-    """Derniers QC pass/fail/inbox du scanner."""
-    result = []
-    pat = re.compile(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ \S+ \S+ (.*)')
-    for line in reversed(lines):
-        lo = line.lower()
-        if any(k in lo for k in ["qc ", "scanner", "inbox", "session mise en file", "quality"]):
-            m = pat.match(line)
-            if m:
-                ts, msg = m.group(1)[11:], m.group(2)  # HH:MM:SS only
-                result.append((ts, msg))
-            if len(result) >= 8:
-                break
-    return list(reversed(result))
+        # ── scanner ──────────────────────────────────────────────────────────
+        if "ThreadPoolExecutor" in tname or tname == "scanner":
+            m2 = pat_qc.search(msg)
+            if m2:
+                scanner.update(status="qc", session=m2.group(1)[-22:], ts=ts)
+            m2 = pat_qc_pass.search(msg)
+            if m2:
+                scanner["qc_done"] += 1
+                scanner.update(status="qc_pass", session=m2.group(1)[-22:], ts=ts)
+                events.append((ts, "ok", f"QC✓ {m2.group(1)[-20:]}  score={float(m2.group(2)):.0f}"))
+            m2 = pat_qc_fail.search(msg)
+            if m2:
+                scanner["qc_fail"] += 1
+                scanner.update(status="qc_fail", session=m2.group(2)[-22:], ts=ts)
+                events.append((ts, "warn", f"QC✗ {m2.group(2)[-20:]}  [{m2.group(1)}]"))
 
-def read_log_tail_filtered(n):
-    lines = read_log_raw()
-    filtered = [l for l in lines if l.strip() and " DEBUG " not in l and "spool-reporter" not in l]
-    return filtered[-n:]
+        # ── quarantaine ──────────────────────────────────────────────────────
+        if "quarantine" in tname:
+            m2 = pat_qnas.search(msg)
+            if m2:
+                events.append((ts, "warn", f"QNAS {m2.group(1)[-20:]}"))
+            m2 = pat_qnas_fail.search(msg)
+            if m2:
+                events.append((ts, "err", f"QNAS✗ {m2.group(1)[-18:]} fallback"))
+
+    return workers, scanner, events[-30:]
+
+def total_speed(workers):
+    return sum(w["speed"] for w in workers.values() if w["status"] == "upload")
 
 # ── TUI ──────────────────────────────────────────────────────────────────────
 
@@ -347,7 +389,6 @@ def main(stdscr):
         try: stdscr.addstr(r, 0, char * cols, attr)
         except curses.error: pass
 
-    tick = 0
     while True:
         key = stdscr.getch()
         if key == ord('q'): break
@@ -355,127 +396,138 @@ def main(stdscr):
         stdscr.erase()
         rows, cols = stdscr.getmaxyx()
 
-        pid        = is_running()
-        st         = db_stats()
-        lines      = read_log_raw()
-        speed_mbps = read_log_speed(lines)
-        inbox_n    = inbox_count()
+        pid     = is_running()
+        st      = db_stats()
+        inbox_n = inbox_count()
+        lines   = read_log_raw(96000)
+        workers, scanner, events = parse_log(lines)
+        spd_total = total_speed(workers)
 
         elapsed    = time.time() - (daemon_start or time.time())
         uptime_str = _fmt_uptime(elapsed)
-        eta_str    = _fmt_eta(st["remaining_b"], speed_mbps)
-        total_b    = st["total_b"]
         sent_b     = st["sent_b"]
+        total_b    = st["total_b"]
         global_pct = sent_b / max(total_b, 1) * 100
+        eta_str    = _fmt_eta(st["remaining_b"], spd_total)
 
         row = 0
 
-        # ── HEADER ───────────────────────────────────────────────────────────
+        # ══ HEADER ════════════════════════════════════════════════════════════
         status_str = f"PID {pid}" if pid else "ARRÊTÉ"
-        hdr_attr   = C_HDR if pid else C_ERR | curses.A_BOLD
-        hdr = f" ⚡ SPOOL  ·  {WORKERS} workers  ·  NAS {NAS_HOST}  ·  {status_str}  ·  up {uptime_str} "
+        hdr_attr   = C_HDR if pid else (C_ERR | curses.A_BOLD)
+        hdr = (f" ⚡ SPOOL  ·  NAS {NAS_HOST}  ·  {status_str}  ·  up {uptime_str}"
+               f"  ·  {spd_total:.1f} MB/s  ·  ETA {eta_str} ")
         put(row, 0, hdr.ljust(cols)[:cols], hdr_attr); row += 1
 
-        # ── COMPTEURS ────────────────────────────────────────────────────────
-        hline(row); row += 1
-        c0, c1, c2, c3, c4 = 2, 20, 38, 54, 70
-        put(row, c0, f"✓ done",    C_DIM);  put(row, c0+8,  f"{st['done']:>7}",    C_OK)
-        put(row, c1, f"⧖ queue",   C_DIM);  put(row, c1+8,  f"{st['queued']:>6}",   C_WARN)
-        put(row, c2, f"⚙ actifs",  C_DIM);  put(row, c2+8,  f"{st['processing']:>4}", C_STAT)
-        put(row, c3, f"✗ échecs",  C_DIM);  put(row, c3+8,  f"{st['failed']:>6}",   C_ERR if st['failed'] else C_NORM)
-        if inbox_n >= 0:
-            put(row, c4, f"📥 inbox",  C_DIM); put(row, c4+8, f"{inbox_n:>6}", C_WARN if inbox_n > 0 else C_NORM)
+        # ══ STATS GLOBALES (1 ligne) ══════════════════════════════════════════
+        bar_w = max(8, cols - 70)
+        put(row, 1,  f"done",     C_DIM)
+        put(row, 6,  f"{st['done']:>6}", C_OK)
+        put(row, 14, f"queue",    C_DIM)
+        put(row, 20, f"{st['queued']:>6}", C_WARN)
+        put(row, 28, f"actifs",   C_DIM)
+        put(row, 35, f"{st['processing']:>2}/{WORKERS}", C_STAT)
+        put(row, 42, f"échecs",   C_DIM)
+        put(row, 49, f"{st['failed']:>5}", C_ERR if st['failed'] else C_DIM)
+        put(row, 56, f"inbox",    C_DIM)
+        put(row, 62, f"{inbox_n if inbox_n >= 0 else '?':>6}", C_WARN if inbox_n > 0 else C_DIM)
+        # mini barre globale à droite
+        if cols > 72:
+            put(row, 70, _bar(global_pct, bar_w), C_OK if global_pct > 50 else C_WARN)
+            put(row, 70 + bar_w + 1, f"{global_pct:.0f}%", C_STAT)
         row += 1
 
-        # ── BARRE PROGRESSION ─────────────────────────────────────────────────
         hline(row); row += 1
-        bar_w = max(10, cols - 32)
-        put(row, 2, "Envoi   ", C_TITLE)
-        put(row, 10, _bar(global_pct, bar_w), C_OK if global_pct > 50 else C_WARN)
-        put(row, 10 + bar_w + 1, f"{global_pct:5.1f}%", C_STAT)
-        put(row, 10 + bar_w + 8, f"{_fmt_size(sent_b)} / {_fmt_size(total_b)}", C_DIM)
-        row += 1
 
-        # ── VITESSE + ETA ─────────────────────────────────────────────────────
-        put(row, 2, "Vitesse ", C_TITLE)
-        put(row, 10, f"{speed_mbps:6.1f} MB/s", C_STAT if speed_mbps > 0 else C_DIM)
-        put(row, 26, f"restant {_fmt_size(st['remaining_b'])}", C_NORM)
-        put(row, 48, f"ETA {eta_str}", C_WARN if eta_str != "--:--" else C_DIM)
+        # ══ GRILLE WORKERS ════════════════════════════════════════════════════
+        # Titre
+        put(row, 1, "W", C_DIM)
+        put(row, 4, "Session", C_DIM)
+        put(row, 28, "Progress", C_DIM)
+        put(row, 28 + max(8, cols - 66), "Files", C_DIM)
+        put(row, 28 + max(8, cols - 66) + 10, "Speed", C_DIM)
+        put(row, 28 + max(8, cols - 66) + 20, "File", C_DIM)
         row += 1
-
-        # ── SCANNER ───────────────────────────────────────────────────────────
-        hline(row); row += 1
-        put(row, 2, f"Scanner  —  inbox: {inbox_n if inbox_n >= 0 else '?'} sessions en attente", C_TITLE); row += 1
         hline(row, "╌"); row += 1
 
-        scanner_lines = parse_scanner_activity(lines)
-        if scanner_lines:
-            for ts, msg in scanner_lines:
-                if row >= rows - 8: break
-                lo = msg.lower()
-                attr = (C_ERR  if "fail" in lo or "error" in lo or "erreur" in lo
-                   else C_WARN if "warn" in lo or "qc fail" in lo
-                   else C_OK   if "pass" in lo or "mise en file" in lo
-                   else C_DIM)
-                put(row, 2, f"{ts}", C_DIM)
-                put(row, 12, msg[:cols-14], attr)
-                row += 1
-        else:
-            put(row, 4, "(aucune activité scanner dans le log récent)", C_DIM); row += 1
+        bar_w2 = max(8, cols - 66)
+        workers_start_row = row
 
-        # ── WORKERS NAS ───────────────────────────────────────────────────────
-        hline(row); row += 1
-        put(row, 2, f"Transferts NAS  {st['processing']}/{WORKERS} actifs", C_TITLE); row += 1
-        hline(row, "╌"); row += 1
+        for idx in range(1, WORKERS + 1):
+            if row >= rows - 6: break
+            w = workers[idx]
+            st_w = w["status"]
 
-        worker_states = parse_worker_states(lines)
-        bar_w2 = max(10, cols - 54)
+            # couleur selon état
+            if st_w == "upload":
+                s_attr = C_OK
+                status_ch = "▶"
+            elif st_w == "retry":
+                s_attr = C_WARN
+                status_ch = "↺"
+            elif st_w == "qc_pass":
+                s_attr = C_OK
+                status_ch = "✓"
+            elif st_w == "qc_fail":
+                s_attr = C_ERR
+                status_ch = "✗"
+            else:
+                s_attr = C_DIM
+                status_ch = "·"
 
-        displayed = 0
-        for sid, size_b, fc in st["proc_rows"]:
-            if row >= rows - 5: break
-            w     = worker_states.get(sid, {})
-            fd    = w.get("files_done", 0)
-            ft    = w.get("file_count", fc or 1)
-            spd   = w.get("speed_mbps", 0.0)
-            fname = w.get("current_file", "…")[-30:]
-            pct   = fd / max(ft, 1) * 100
-            label = sid[-20:].ljust(20)
-            bar   = _bar(pct, bar_w2)
-            put(row, 2,  label, C_NORM)
-            put(row, 23, bar,   C_OK if pct > 50 else C_WARN)
-            put(row, 23 + bar_w2 + 1, f"{pct:5.1f}%", C_STAT)
-            put(row, 23 + bar_w2 + 8, f"{fd}/{ft}f  {spd:.1f}MB/s", C_DIM)
+            put(row, 1, f"{idx:>2}", C_DIM)
+            put(row, 3, status_ch, s_attr)
+
+            if st_w == "upload":
+                sid_short = w["session"][-22:].ljust(22)
+                bar       = _bar(w["pct"], bar_w2)
+                files_str = f"{w['files_done']}/{w['file_count']}f"
+                spd_str   = f"{w['speed']:5.1f}MB/s"
+                file_str  = w["file"][:max(0, cols - 66 - bar_w2 - 4)]
+
+                put(row, 5,  sid_short,                         C_NORM)
+                put(row, 28, bar,                               C_OK if w["pct"] > 50 else C_WARN)
+                put(row, 28 + bar_w2 + 1, f"{w['pct']:4.0f}%", C_STAT)
+                put(row, 28 + bar_w2 + 6, files_str.ljust(10), C_DIM)
+                put(row, 28 + bar_w2 + 16, spd_str,            C_STAT)
+                put(row, 28 + bar_w2 + 24, file_str,           C_DIM)
+            elif st_w == "idle":
+                put(row, 5, "idle", C_DIM)
+            elif st_w == "retry":
+                put(row, 5, w["session"][-22:].ljust(22), C_WARN)
+                put(row, 28, "en attente retry...", C_WARN)
+            else:
+                put(row, 5, w["session"][-22:] if w["session"] else "—", s_attr)
+
             row += 1
-            put(row, 4, f"↳ {fname}", C_DIM); row += 1
-            displayed += 1
 
-        if displayed == 0:
-            put(row, 4, "(aucun transfert actif)", C_DIM); row += 1
+        # ══ SCANNER (1 ligne sous les workers) ════════════════════════════════
+        hline(row, "╌"); row += 1
+        sc = scanner
+        sc_status = {"qc": C_WARN, "qc_pass": C_OK, "qc_fail": C_ERR, "idle": C_DIM}.get(sc["status"], C_DIM)
+        sc_icon   = {"qc": "⟳", "qc_pass": "✓", "qc_fail": "✗", "idle": "·"}.get(sc["status"], "·")
+        put(row, 1, "SC", C_DIM)
+        put(row, 3, sc_icon, sc_status)
+        put(row, 5, f"Scanner  QC:{sc['qc_done']} pass  {sc['qc_fail']} fail", C_DIM)
+        if sc["session"]:
+            put(row, 40, sc["session"][-30:], sc_status)
+        if sc["ts"]:
+            put(row, cols - 10, sc["ts"], C_DIM)
+        row += 1
 
-        # ── LOGS ─────────────────────────────────────────────────────────────
-        if row < rows - 3:
-            hline(row); row += 1
-            put(row, 2, "Logs  (q = quitter)", C_TITLE); row += 1
+        # ══ EVENTS RÉCENTS ════════════════════════════════════════════════════
+        hline(row); row += 1
+        put(row, 1, "Événements récents  (q = quitter)", C_TITLE); row += 1
 
-            avail = max(0, rows - row - 1)
-            if avail > 0:
-                logs = read_log_tail_filtered(avail)
-                for line in logs:
-                    lo = line.lower()
-                    attr = (C_ERR  if "error" in lo or "erreur" in lo
-                       else C_WARN if "warning" in lo or "warn" in lo
-                       else C_OK   if "info" in lo
-                       else C_NORM)
-                    # Trim timestamp prefix to save space: keep HH:MM:SS + rest
-                    display = line
-                    if len(line) > 23 and line[10] == ' ':
-                        display = line[11:]  # remove date, keep time + rest
-                    put(row, 1, display[:cols - 2], attr)
-                    row += 1
-                    if row >= rows - 1: break
+        avail = max(0, rows - row - 1)
+        ev_attr = {"done": C_OK, "ok": C_OK, "warn": C_WARN, "err": C_ERR}
+        for ts, kind, msg in reversed(events[-avail:]):
+            if row >= rows - 1: break
+            attr = ev_attr.get(kind, C_DIM)
+            put(row, 1, ts, C_DIM)
+            put(row, 10, msg[:cols - 12], attr)
+            row += 1
 
-        tick += 1
         stdscr.refresh()
         time.sleep(1.0)
 
