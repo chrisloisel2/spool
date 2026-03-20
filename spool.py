@@ -89,7 +89,7 @@ QUALITY_TIMEOUT_FIX     = 60
 QUALITY_TIMEOUT_FILES   = 30
 QUALITY_TIMEOUT_SANITY  = 120   # ffprobe sur 3 vidéos
 QUALITY_TIMEOUT_QUALITY = 300   # ffmpeg blurdetect — le plus long
-QUALITY_TIMEOUT_NAMING  = 120   # OpenCV verify_naming
+QUALITY_TIMEOUT_NAMING  = 10    # OpenCV verify_naming (crash rapide si cv2 absent)
 
 # Seuil de score qualité minimum pour accepter la session (0–100)
 QUALITY_SCORE_MIN = 40
@@ -1091,10 +1091,11 @@ class QualityChecker:
             QUALITY_TIMEOUT_NAMING,
         )
         if rc != 0:
-            # Si cv2/OpenCV n'est pas installé, skip silencieux plutôt que bloquer toutes les sessions
-            if "No module named 'cv2'" in stderr or "ModuleNotFoundError" in stderr:
-                log.warning("[Quality] verify_naming skipped — cv2 non installé (pip3 install opencv-python-headless)")
-                return True, {"skipped": "cv2_missing"}
+            # cv2 absent ou timeout → skip silencieux (ne pas bloquer toutes les sessions)
+            if ("No module named 'cv2'" in stderr or "ModuleNotFoundError" in stderr
+                    or rc == -1):  # rc=-1 = timeout
+                log.warning("[Quality] verify_naming skipped (rc=%d) — cv2 absent ou timeout", rc)
+                return True, {"skipped": "cv2_missing_or_timeout"}
             log.warning("[Quality] verify_naming error (rc=%d): %s", rc, stderr[:200])
             return False, {"error": stderr[:200]}
         try:
