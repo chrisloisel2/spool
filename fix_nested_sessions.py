@@ -236,6 +236,33 @@ def cmd_status_errors(db_path):
     return 0
 
 
+def cmd_inspect(db_path, session_id):
+    """Affiche l'entrée DB complète d'une session."""
+    try:
+        conn = sqlite3.connect(db_path, timeout=30)
+    except Exception as e:
+        print(f"[ERREUR] DB : {e}")
+        return 1
+    row = conn.execute(
+        "SELECT id, session_dir, session_id, status, attempts, last_error, created_at FROM jobs WHERE session_id=?",
+        (session_id,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        print(f"Session '{session_id}' introuvable en DB.")
+        return 1
+    jid, session_dir, sid, status, attempts, last_error, created_at = row
+    print(f"id          : {jid}")
+    print(f"session_id  : {sid}")
+    print(f"session_dir : {session_dir}")
+    print(f"  → existe  : {os.path.isdir(session_dir) if session_dir else 'N/A'}")
+    print(f"status      : {status}")
+    print(f"attempts    : {attempts}")
+    print(f"last_error  : {last_error}")
+    print(f"created_at  : {created_at}")
+    return 0
+
+
 def cmd_status_recoverable(db_path):
     """Liste les jobs failed dont le dossier session existe encore sur disque → requeables."""
     try:
@@ -304,6 +331,8 @@ if __name__ == "__main__":
         sys.exit(cmd_status(DB_PATH))
     if len(sys.argv) >= 2 and sys.argv[1] == "status-errors":
         sys.exit(cmd_status_errors(DB_PATH))
+    if len(sys.argv) >= 3 and sys.argv[1] == "inspect":
+        sys.exit(cmd_inspect(DB_PATH, sys.argv[2]))
     if len(sys.argv) >= 2 and sys.argv[1] == "status-recoverable":
         sys.exit(cmd_status_recoverable(DB_PATH))
     if len(sys.argv) >= 2 and sys.argv[1] == "requeue-failed":
