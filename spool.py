@@ -1321,16 +1321,29 @@ class Scanner(threading.Thread):
             in_flight = set(self._in_flight)
 
         candidates = []
+        n_skip_known = 0
+        n_skip_inflight = 0
+        n_skip_nodir = 0
+        n_nomatch = 0
         for name in sorted(entries):
             if not SESSION_RE.match(name):
+                n_nomatch += 1
                 continue
-            if name in known or name in in_flight:
+            if name in known:
+                n_skip_known += 1
+                continue
+            if name in in_flight:
+                n_skip_inflight += 1
                 continue
             if not os.path.isdir(os.path.join(INBOX_DIR, name)):
+                n_skip_nodir += 1
                 continue
             candidates.append(name)
 
         inbox_pending = len(candidates) + len(in_flight)
+        log.info("[Scanner] inbox=%d entries=%d known=%d in_flight=%d candidates=%d (skip_known=%d skip_flight=%d skip_nodir=%d nomatch=%d)",
+                 inbox_pending, len(entries), len(known), len(in_flight), len(candidates),
+                 n_skip_known, n_skip_inflight, n_skip_nodir, n_nomatch)
         if candidates:
             log.info("[Scanner] %d nouvelles sessions découvertes (en_cours=%d)", len(candidates), len(in_flight))
 

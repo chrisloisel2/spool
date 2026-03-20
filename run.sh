@@ -309,7 +309,7 @@ def parse_log(lines):
                     events.append((ts, "err", f"✗ fail {w['session'][-22:]}"))
 
         # ── scanner ──────────────────────────────────────────────────────────
-        if "ThreadPoolExecutor" in tname or tname == "scanner":
+        if "ThreadPoolExecutor" in tname or tname == "scanner" or tname.startswith("qc_"):
             m2 = pat_qc.search(msg)
             if m2:
                 scanner.update(status="qc", session=m2.group(1)[-22:], ts=ts)
