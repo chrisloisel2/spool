@@ -162,7 +162,10 @@ SESSION_RE = re.compile(r"^session_\d{8}_\d{6}$")
 
 def db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=60)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=60000")   # attend 60s au lieu de lever immédiatement
     conn.executescript(SCHEMA)
     return conn
 
@@ -949,18 +952,18 @@ class NASClient:
         with open(local, "rb", buffering=SFTP_READ_BUFFER) as fh:
             with self.sftp.open(tmp, "wb") as rh:
                 rh.set_pipelined(True)
-                sent = 0
                 while True:
                     chunk = fh.read(CHUNK)
                     if not chunk:
                         break
+                    # Vérifie que le transport est toujours vivant avant d'écrire
+                    tr = self.ssh.get_transport()
+                    if not tr or not tr.is_active():
+                        raise EOFError("Transport SSH mort pendant l'upload")
                     rh.write(chunk)
-                    sent += len(chunk)
-                    # Keepalive manuel entre chunks
+                    # Keepalive entre chunks
                     try:
-                        tr = self.ssh.get_transport()
-                        if tr:
-                            tr.send_ignore()
+                        tr.send_ignore()
                     except Exception:
                         pass
 
@@ -1750,9 +1753,9 @@ def main():
                 time.sleep(SCAN_INTERVAL)
     else:
         log.info("[App] Démarrage en mode multi-thread (%d workers).", WORKERS)
-        Scanner(conn).start()
+        Scanner(db()).start()   # connexion dédiée au scanner
         for i in range(WORKERS):
-            Worker(i + 1, db()).start()
+            Worker(i + 1, db()).start()   # connexion dédiée à chaque worker
         while True:
             time.sleep(60)
 
