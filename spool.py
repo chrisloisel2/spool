@@ -34,9 +34,9 @@ SPOOL_DIR = "/srv/exoria/spool"
 QUARANTINE_DIR = "/srv/exoria/quarantine"
 DB_PATH = "/srv/exoria/queue.db"
 
-SCAN_INTERVAL = 1  # déjà à 1s — optimal
+SCAN_INTERVAL = 0    # pas de pause entre batches si la queue est vide
 SCAN_QC_WORKERS = 8  # threads parallèles pour le quality check
-SCAN_BATCH_SIZE = 50  # sessions traitées par batch (évite de bloquer des heures)
+SCAN_BATCH_SIZE = 200 # sessions par batch — assez grand pour alimenter 16 workers
 
 # Nombre de workers NAS en parallèle.
 # 1 = tout dans le thread principal (pas de threads supplémentaires).
@@ -1272,10 +1272,13 @@ class Scanner(threading.Thread):
         log.info("[Scanner] Démarrage — surveillance du dossier : %s", INBOX_DIR)
         while True:
             try:
-                self.scan()
+                had_work = self.scan()
             except Exception as e:
                 log.error("[Scanner] Erreur inattendue : %s\n%s", e, traceback.format_exc())
-            time.sleep(SCAN_INTERVAL)
+                had_work = False
+            # Pause seulement si rien à faire (évite de saturer le CPU à vide)
+            if not had_work:
+                time.sleep(1)
 
     def _dir_size_and_count(self, path: str):
         total_bytes = 0
@@ -1302,13 +1305,14 @@ class Scanner(threading.Thread):
                       name, e, traceback.format_exc())
             return name, None
 
-    def scan(self):
+    def scan(self) -> bool:
+        """Retourne True si un batch a été traité, False si rien à faire."""
         # Cherche les sous-dossiers directs de inbox/ qui matchent session_YYYYMMDD_HHMMSS
         try:
             entries = os.listdir(INBOX_DIR)
         except Exception as e:
             log.error("[Scanner] Impossible de lire inbox : %s", e)
-            return
+            return False
 
         # Récupère tous les session_id déjà connus en une seule requête
         try:
@@ -1317,7 +1321,7 @@ class Scanner(threading.Thread):
             )
         except Exception as e:
             log.error("[Scanner] Impossible de lire les jobs connus : %s", e)
-            return
+            return False
 
         # Filtre les sessions candidates (pas encore en DB)
         candidates = []
@@ -1337,7 +1341,7 @@ class Scanner(threading.Thread):
             tui_log(f"INBOX {inbox_pending} sessions à traiter")
 
         if not candidates:
-            return
+            return False
 
         # Traite par batch pour insérer en DB progressivement et laisser les workers démarrer
         batch = candidates[:SCAN_BATCH_SIZE]
@@ -1443,6 +1447,8 @@ class Scanner(threading.Thread):
             tui_set_queue(len(rows), total_q_bytes)
         except Exception as e:
             log.debug("[Scanner] Reporter queue update failed: %s", e)
+
+        return True
 
 # =========================
 # WORKER — NAS persistent + reconnect/backoff
