@@ -36,6 +36,7 @@ DB_PATH = "/srv/exoria/queue.db"
 
 SCAN_INTERVAL = 1  # déjà à 1s — optimal
 SCAN_QC_WORKERS = 8  # threads parallèles pour le quality check
+SCAN_BATCH_SIZE = 50  # sessions traitées par batch (évite de bloquer des heures)
 
 # Nombre de workers NAS en parallèle.
 # 1 = tout dans le thread principal (pas de threads supplémentaires).
@@ -1268,26 +1269,41 @@ class Scanner(threading.Thread):
             log.error("[Scanner] Impossible de lire inbox : %s", e)
             return
 
+        # Récupère tous les session_id déjà connus en une seule requête
+        try:
+            known = set(
+                r[0] for r in self.conn.execute("SELECT session_id FROM jobs").fetchall()
+            )
+        except Exception as e:
+            log.error("[Scanner] Impossible de lire les jobs connus : %s", e)
+            return
+
         # Filtre les sessions candidates (pas encore en DB)
         candidates = []
-        for name in entries:
+        for name in sorted(entries):
             if not SESSION_RE.match(name):
+                continue
+            if name in known:
                 continue
             session_dir = os.path.join(INBOX_DIR, name)
             if not os.path.isdir(session_dir):
                 continue
-            existing = self.conn.execute(
-                "SELECT id FROM jobs WHERE session_id=?", (name,)
-            ).fetchone()
-            if not existing:
-                candidates.append(name)
+            candidates.append(name)
+
+        inbox_pending = len(candidates)
+        if inbox_pending:
+            log.info("[Scanner] %d sessions en attente dans inbox (batch=%d)", inbox_pending, SCAN_BATCH_SIZE)
+            tui_log(f"INBOX {inbox_pending} sessions à traiter")
 
         if not candidates:
             return
 
+        # Traite par batch pour insérer en DB progressivement et laisser les workers démarrer
+        batch = candidates[:SCAN_BATCH_SIZE]
+
         # ── Quality check en parallèle ───────────────────────────────────────
         with concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_QC_WORKERS) as pool:
-            futures = {pool.submit(self._qc_one, name): name for name in candidates}
+            futures = {pool.submit(self._qc_one, name): name for name in batch}
             for future in concurrent.futures.as_completed(futures):
                 try:
                     name, qr = future.result()

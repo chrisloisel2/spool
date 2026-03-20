@@ -152,15 +152,18 @@ attach_tui() {
     echo ""
     sleep 0.5
     "$PYTHON" - << 'PYEOF'
-import sys, os, time, curses, sqlite3, datetime as dt
+import sys, os, time, curses, sqlite3, datetime as dt, re
 
-LOG_FILE  = "/srv/exoria/logs/spool.log"
-DB_PATH   = "/srv/exoria/queue.db"
-PID_FILE  = "/tmp/spool_daemon.pid"
-WORKERS   = 16
-NAS_HOST  = "192.168.88.82"
-# Nombre d'octets lus depuis la fin du log pour la section logs
-LOG_TAIL_BYTES = 32000
+LOG_FILE       = "/srv/exoria/logs/spool.log"
+DB_PATH        = "/srv/exoria/queue.db"
+INBOX_DIR      = "/srv/exoria/inbox"
+PID_FILE       = "/tmp/spool_daemon.pid"
+WORKERS        = 16
+NAS_HOST       = "192.168.88.82"
+SESSION_PAT    = re.compile(r'^session_\d{8}_\d{6}$')
+LOG_TAIL_BYTES = 48000
+
+# ── helpers ──────────────────────────────────────────────────────────────────
 
 def _fmt_size(b):
     if b >= 1<<30: return f"{b/(1<<30):.1f} GB"
@@ -176,6 +179,13 @@ def _fmt_eta(remaining_b, speed_mbps):
     if m:  return f"{m}m{s:02d}s"
     return f"{s}s"
 
+def _fmt_uptime(elapsed):
+    h = int(elapsed // 3600)
+    m = int((elapsed % 3600) // 60)
+    s = int(elapsed % 60)
+    if h: return f"{h}h{m:02d}m"
+    return f"{m}m{s:02d}s"
+
 def _bar(pct, width=20, filled="█", empty="░"):
     n = max(0, min(int(pct / 100 * width), width))
     return filled * n + empty * (width - n)
@@ -188,82 +198,77 @@ def is_running():
     except Exception:
         return None
 
+# ── données DB ───────────────────────────────────────────────────────────────
+
 def db_stats():
     try:
         conn = sqlite3.connect(DB_PATH, timeout=2)
         rows = conn.execute(
             "SELECT status, COUNT(*), SUM(size_bytes) FROM jobs GROUP BY status"
         ).fetchall()
+        proc_rows = conn.execute(
+            "SELECT session_id, size_bytes, file_count FROM jobs "
+            "WHERE status='processing' ORDER BY updated_at DESC LIMIT 16"
+        ).fetchall()
         conn.close()
         counts, sizes = {}, {}
         for st, n, b in rows:
             counts[st] = n
             sizes[st] = b or 0
-        queued     = counts.get("queued", 0)
-        processing = counts.get("processing", 0)
-        done       = counts.get("done", 0)
-        failed     = counts.get("failed", 0)
+        queued      = counts.get("queued", 0)
+        processing  = counts.get("processing", 0)
+        done        = counts.get("done", 0)
+        failed      = counts.get("failed", 0)
         remaining_b = sizes.get("queued", 0) + sizes.get("processing", 0)
         total_b     = sizes.get("queued", 0) + sizes.get("processing", 0) + sizes.get("done", 0)
         sent_b      = sizes.get("done", 0)
         return dict(queued=queued, processing=processing, done=done, failed=failed,
-                    total_b=total_b, sent_b=sent_b, remaining_b=remaining_b)
+                    total_b=total_b, sent_b=sent_b, remaining_b=remaining_b,
+                    proc_rows=proc_rows)
     except Exception:
         return dict(queued=0, processing=0, done=0, failed=0,
-                    total_b=0, sent_b=0, remaining_b=0)
+                    total_b=0, sent_b=0, remaining_b=0, proc_rows=[])
 
-def read_log_tail_raw(n_bytes=None, n_lines=None):
-    """Retourne les dernières lignes non-vides du log."""
+def inbox_count():
+    try:
+        return sum(1 for e in os.listdir(INBOX_DIR) if SESSION_PAT.match(e))
+    except Exception:
+        return -1
+
+# ── lecture log ──────────────────────────────────────────────────────────────
+
+def read_log_raw(n_bytes=LOG_TAIL_BYTES):
     try:
         size = os.path.getsize(LOG_FILE)
-        read_bytes = n_bytes or LOG_TAIL_BYTES
         with open(LOG_FILE, "rb") as f:
-            f.seek(max(0, size - read_bytes))
-            raw = f.read().decode("utf-8", errors="replace")
-        lines = [l for l in raw.splitlines() if l.strip()]
-        if n_lines:
-            return lines[-n_lines:]
-        return lines
+            f.seek(max(0, size - n_bytes))
+            return f.read().decode("utf-8", errors="replace").splitlines()
     except Exception as e:
-        return [f"[erreur lecture log: {e}]"]
+        return [f"[erreur log: {e}]"]
 
-def parse_worker_states():
-    """
-    Parse le log pour extraire l'état de chaque worker actif.
-    Retourne dict: session_id -> {files_done, file_count, speed_mbps, current_file, last_seen}
-    Format log: [JOB xxxxxxxx] N/M 'path' @ X.X MB/s
-    """
-    lines = read_log_tail_raw(n_bytes=64000)
+def parse_worker_states(lines):
+    """Extrait l'état des workers NAS depuis le log."""
     workers = {}
-    import re
-    pat = re.compile(r'\[JOB ([0-9a-f]+)\]\s+(\d+)/(\d+)\s+\'([^\']+)\'\s+@\s+([\d.]+)\s+MB/s')
+    pat  = re.compile(r'\[JOB ([0-9a-f]+)\]\s+(\d+)/(\d+)\s+\'([^\']+)\'\s+@\s+([\d.]+)\s+MB/s')
+    pat2 = re.compile(r"\[JOB ([0-9a-f]+)\] Session '([^']+)'")
     for line in lines:
         m = pat.search(line)
         if m:
             jid, done, total, fname, spd = m.group(1), int(m.group(2)), int(m.group(3)), m.group(4), float(m.group(5))
-            # Cherche session_id associé au job dans les lignes précédentes
-            workers[jid] = {"files_done": done, "file_count": total,
-                            "current_file": fname, "speed_mbps": spd}
-    # Associe session_id depuis les lignes "Session '...' — N fichiers"
-    pat2 = re.compile(r"\[JOB ([0-9a-f]+)\] Session '([^']+)'")
+            workers[jid] = {"files_done": done, "file_count": total, "current_file": fname, "speed_mbps": spd}
     for line in lines:
         m = pat2.search(line)
         if m:
             jid, sid = m.group(1), m.group(2)
             if jid in workers:
                 workers[jid]["session_id"] = sid
-    # Construit liste indexée par session_id
     result = {}
     for jid, w in workers.items():
         sid = w.get("session_id", jid[:8])
         result[sid] = w
     return result
 
-def read_log_speed(lines=None):
-    """Vitesse totale = somme des dernières vitesses par worker actif."""
-    if lines is None:
-        lines = read_log_tail_raw(n_bytes=16000)
-    import re
+def read_log_speed(lines):
     pat = re.compile(r'\[JOB ([0-9a-f]+)\].*@\s+([\d.]+)\s+MB/s')
     last_speed = {}
     for line in reversed(lines):
@@ -276,25 +281,40 @@ def read_log_speed(lines=None):
             break
     return sum(last_speed.values()) if last_speed else 0.0
 
-def read_log_tail(n):
-    """Retourne les n dernières lignes non-vides du log (pour section logs)."""
-    # Filtre les lignes DEBUG trop verbeuses pour le TUI
-    lines = read_log_tail_raw(n_bytes=LOG_TAIL_BYTES)
-    filtered = [l for l in lines if " DEBUG " not in l]
+def parse_scanner_activity(lines):
+    """Derniers QC pass/fail/inbox du scanner."""
+    result = []
+    pat = re.compile(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ \S+ \S+ (.*)')
+    for line in reversed(lines):
+        lo = line.lower()
+        if any(k in lo for k in ["qc ", "scanner", "inbox", "session mise en file", "quality"]):
+            m = pat.match(line)
+            if m:
+                ts, msg = m.group(1)[11:], m.group(2)  # HH:MM:SS only
+                result.append((ts, msg))
+            if len(result) >= 8:
+                break
+    return list(reversed(result))
+
+def read_log_tail_filtered(n):
+    lines = read_log_raw()
+    filtered = [l for l in lines if l.strip() and " DEBUG " not in l and "spool-reporter" not in l]
     return filtered[-n:]
+
+# ── TUI ──────────────────────────────────────────────────────────────────────
 
 def main(stdscr):
     curses.curs_set(0)
     stdscr.nodelay(True)
     curses.start_color()
     curses.use_default_colors()
-    curses.init_pair(1, curses.COLOR_CYAN,    -1)
-    curses.init_pair(2, curses.COLOR_GREEN,   -1)
-    curses.init_pair(3, curses.COLOR_YELLOW,  -1)
-    curses.init_pair(4, curses.COLOR_RED,     -1)
-    curses.init_pair(5, curses.COLOR_MAGENTA, -1)
-    curses.init_pair(6, curses.COLOR_WHITE,   -1)
-    curses.init_pair(7, curses.COLOR_BLACK,   curses.COLOR_CYAN)
+    curses.init_pair(1, curses.COLOR_CYAN,    -1)  # title
+    curses.init_pair(2, curses.COLOR_GREEN,   -1)  # ok
+    curses.init_pair(3, curses.COLOR_YELLOW,  -1)  # warn
+    curses.init_pair(4, curses.COLOR_RED,     -1)  # err
+    curses.init_pair(5, curses.COLOR_MAGENTA, -1)  # stat
+    curses.init_pair(6, curses.COLOR_WHITE,   -1)  # norm
+    curses.init_pair(7, curses.COLOR_BLACK,   curses.COLOR_CYAN)  # hdr bg
 
     C_TITLE = curses.color_pair(1) | curses.A_BOLD
     C_OK    = curses.color_pair(2)
@@ -303,30 +323,31 @@ def main(stdscr):
     C_STAT  = curses.color_pair(5) | curses.A_BOLD
     C_NORM  = curses.color_pair(6)
     C_HDR   = curses.color_pair(7)
+    C_DIM   = curses.color_pair(6) | curses.A_DIM
 
-    # Uptime depuis le démarrage du daemon (lu depuis le log)
     daemon_start = None
     try:
-        size = os.path.getsize(LOG_FILE)
         with open(LOG_FILE, "rb") as f:
-            header = f.read(200).decode("utf-8", errors="replace")
-        first_line = [l for l in header.splitlines() if l.strip()]
-        if first_line:
-            ts_str = first_line[0][:19]
-            daemon_start = dt.datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S").timestamp()
+            header = f.read(300).decode("utf-8", errors="replace")
+        first_lines = [l for l in header.splitlines() if l.strip()]
+        if first_lines:
+            daemon_start = dt.datetime.strptime(first_lines[0][:19], "%Y-%m-%d %H:%M:%S").timestamp()
     except Exception:
         daemon_start = time.time()
 
     def put(r, c, text, attr=C_NORM):
         rows, cols = stdscr.getmaxyx()
-        if r >= rows - 1 or c >= cols: return
-        try: stdscr.addstr(r, c, text[:cols - c], attr)
+        if r >= rows - 1 or c < 0 or c >= cols: return
+        try: stdscr.addstr(r, c, str(text)[:max(0, cols - c)], attr)
         except curses.error: pass
 
-    def hline(r, char="─"):
+    def hline(r, char="─", attr=C_NORM):
         rows, cols = stdscr.getmaxyx()
-        put(r, 0, char * cols)
+        if r >= rows - 1: return
+        try: stdscr.addstr(r, 0, char * cols, attr)
+        except curses.error: pass
 
+    tick = 0
     while True:
         key = stdscr.getch()
         if key == ord('q'): break
@@ -336,105 +357,125 @@ def main(stdscr):
 
         pid        = is_running()
         st         = db_stats()
-        speed_mbps = read_log_speed()
+        lines      = read_log_raw()
+        speed_mbps = read_log_speed(lines)
+        inbox_n    = inbox_count()
 
-        elapsed = time.time() - (daemon_start or time.time())
-        eta_str = _fmt_eta(st["remaining_b"], speed_mbps)
-        total_b = st["total_b"]
-        sent_b  = st["sent_b"]
+        elapsed    = time.time() - (daemon_start or time.time())
+        uptime_str = _fmt_uptime(elapsed)
+        eta_str    = _fmt_eta(st["remaining_b"], speed_mbps)
+        total_b    = st["total_b"]
+        sent_b     = st["sent_b"]
         global_pct = sent_b / max(total_b, 1) * 100
 
         row = 0
 
         # ── HEADER ───────────────────────────────────────────────────────────
-        status_tag = f"PID {pid}" if pid else "ARRÊTÉ"
+        status_str = f"PID {pid}" if pid else "ARRÊTÉ"
         hdr_attr   = C_HDR if pid else C_ERR | curses.A_BOLD
-        uptime     = f"up {int(elapsed//3600):02d}h{int((elapsed%3600)//60):02d}m"
-        hdr = f" ⚡ SPOOL  ·  {WORKERS} workers  ·  NAS {NAS_HOST}  ·  {status_tag}  ·  {uptime} "
+        hdr = f" ⚡ SPOOL  ·  {WORKERS} workers  ·  NAS {NAS_HOST}  ·  {status_str}  ·  up {uptime_str} "
         put(row, 0, hdr.ljust(cols)[:cols], hdr_attr); row += 1
 
         # ── COMPTEURS ────────────────────────────────────────────────────────
         hline(row); row += 1
-        put(row,  2, f"✓ {st['done']:>6} envoyées",    C_OK)
-        put(row, 24, f"⧖ {st['queued']:>5} en attente", C_WARN)
-        put(row, 44, f"⚙ {st['processing']:>2} actifs",  C_STAT)
-        put(row, 58, f"✗ {st['failed']:>5} échecs",     C_ERR if st['failed'] else C_NORM)
+        c0, c1, c2, c3, c4 = 2, 20, 38, 54, 70
+        put(row, c0, f"✓ done",    C_DIM);  put(row, c0+8,  f"{st['done']:>7}",    C_OK)
+        put(row, c1, f"⧖ queue",   C_DIM);  put(row, c1+8,  f"{st['queued']:>6}",   C_WARN)
+        put(row, c2, f"⚙ actifs",  C_DIM);  put(row, c2+8,  f"{st['processing']:>4}", C_STAT)
+        put(row, c3, f"✗ échecs",  C_DIM);  put(row, c3+8,  f"{st['failed']:>6}",   C_ERR if st['failed'] else C_NORM)
+        if inbox_n >= 0:
+            put(row, c4, f"📥 inbox",  C_DIM); put(row, c4+8, f"{inbox_n:>6}", C_WARN if inbox_n > 0 else C_NORM)
         row += 1
 
-        # ── BARRE GLOBALE ─────────────────────────────────────────────────────
+        # ── BARRE PROGRESSION ─────────────────────────────────────────────────
         hline(row); row += 1
-        bar_w = max(10, cols - 34)
-        put(row, 2, "Global  ", C_TITLE)
+        bar_w = max(10, cols - 32)
+        put(row, 2, "Envoi   ", C_TITLE)
         put(row, 10, _bar(global_pct, bar_w), C_OK if global_pct > 50 else C_WARN)
         put(row, 10 + bar_w + 1, f"{global_pct:5.1f}%", C_STAT)
-        put(row, 10 + bar_w + 8, f"{_fmt_size(sent_b)} / {_fmt_size(total_b)}", C_NORM)
+        put(row, 10 + bar_w + 8, f"{_fmt_size(sent_b)} / {_fmt_size(total_b)}", C_DIM)
         row += 1
 
         # ── VITESSE + ETA ─────────────────────────────────────────────────────
-        put(row, 2, "Vitesse  ", C_TITLE)
-        put(row, 11, f"{speed_mbps:6.1f} MB/s", C_STAT)
-        put(row, 28, f"restant {_fmt_size(st['remaining_b'])}", C_NORM)
-        put(row, 48, f"ETA {eta_str}", C_WARN if eta_str != "--:--" else C_NORM)
+        put(row, 2, "Vitesse ", C_TITLE)
+        put(row, 10, f"{speed_mbps:6.1f} MB/s", C_STAT if speed_mbps > 0 else C_DIM)
+        put(row, 26, f"restant {_fmt_size(st['remaining_b'])}", C_NORM)
+        put(row, 48, f"ETA {eta_str}", C_WARN if eta_str != "--:--" else C_DIM)
         row += 1
 
-        # ── WORKERS DÉTAIL ───────────────────────────────────────────────────
+        # ── SCANNER ───────────────────────────────────────────────────────────
         hline(row); row += 1
-        put(row, 2, f"Transferts actifs  {st['processing']}/{WORKERS}  —  {st['queued']} en attente", C_TITLE); row += 1
+        put(row, 2, f"Scanner  —  inbox: {inbox_n if inbox_n >= 0 else '?'} sessions en attente", C_TITLE); row += 1
         hline(row, "╌"); row += 1
 
-        worker_states = parse_worker_states()
-        bar_w2 = max(10, cols - 52)
+        scanner_lines = parse_scanner_activity(lines)
+        if scanner_lines:
+            for ts, msg in scanner_lines:
+                if row >= rows - 8: break
+                lo = msg.lower()
+                attr = (C_ERR  if "fail" in lo or "error" in lo or "erreur" in lo
+                   else C_WARN if "warn" in lo or "qc fail" in lo
+                   else C_OK   if "pass" in lo or "mise en file" in lo
+                   else C_DIM)
+                put(row, 2, f"{ts}", C_DIM)
+                put(row, 12, msg[:cols-14], attr)
+                row += 1
+        else:
+            put(row, 4, "(aucune activité scanner dans le log récent)", C_DIM); row += 1
 
-        # Sessions processing depuis la DB
-        try:
-            conn2 = sqlite3.connect(DB_PATH, timeout=1)
-            proc_rows = conn2.execute(
-                "SELECT session_id, size_bytes, file_count FROM jobs WHERE status='processing' ORDER BY updated_at DESC LIMIT 16"
-            ).fetchall()
-            conn2.close()
-        except Exception:
-            proc_rows = []
+        # ── WORKERS NAS ───────────────────────────────────────────────────────
+        hline(row); row += 1
+        put(row, 2, f"Transferts NAS  {st['processing']}/{WORKERS} actifs", C_TITLE); row += 1
+        hline(row, "╌"); row += 1
+
+        worker_states = parse_worker_states(lines)
+        bar_w2 = max(10, cols - 54)
 
         displayed = 0
-        for sid, size_b, fc in proc_rows:
-            if row >= rows - 6: break
-            w = worker_states.get(sid, {})
+        for sid, size_b, fc in st["proc_rows"]:
+            if row >= rows - 5: break
+            w     = worker_states.get(sid, {})
             fd    = w.get("files_done", 0)
             ft    = w.get("file_count", fc or 1)
             spd   = w.get("speed_mbps", 0.0)
-            fname = w.get("current_file", "…")[-28:]
+            fname = w.get("current_file", "…")[-30:]
             pct   = fd / max(ft, 1) * 100
-            label = sid[-22:].ljust(22)
+            label = sid[-20:].ljust(20)
             bar   = _bar(pct, bar_w2)
             put(row, 2,  label, C_NORM)
-            put(row, 25, bar,   C_OK if pct > 50 else C_WARN)
-            put(row, 25 + bar_w2 + 1, f"{pct:5.1f}%", C_STAT)
-            put(row, 25 + bar_w2 + 8, f"{fd:>3}/{ft}f  {spd:.1f}MB/s", C_NORM)
+            put(row, 23, bar,   C_OK if pct > 50 else C_WARN)
+            put(row, 23 + bar_w2 + 1, f"{pct:5.1f}%", C_STAT)
+            put(row, 23 + bar_w2 + 8, f"{fd}/{ft}f  {spd:.1f}MB/s", C_DIM)
             row += 1
-            put(row, 4, f"↳ {fname}", C_NORM); row += 1
+            put(row, 4, f"↳ {fname}", C_DIM); row += 1
             displayed += 1
 
         if displayed == 0:
-            put(row, 4, "(aucun transfert actif détecté dans le log)", C_NORM); row += 1
+            put(row, 4, "(aucun transfert actif)", C_DIM); row += 1
 
         # ── LOGS ─────────────────────────────────────────────────────────────
-        if row < rows - 4:
+        if row < rows - 3:
             hline(row); row += 1
-            put(row, 2, "Logs récents  (q = quitter)", C_TITLE); row += 1
-            hline(row, "╌"); row += 1
+            put(row, 2, "Logs  (q = quitter)", C_TITLE); row += 1
 
             avail = max(0, rows - row - 1)
-            logs  = read_log_tail(avail) if avail > 0 else []
-            for line in logs:
-                lo = line.lower()
-                attr = (C_ERR  if "error" in lo
-                   else C_WARN if "warning" in lo or "warn" in lo
-                   else C_OK   if "info" in lo
-                   else C_NORM)
-                put(row, 1, line[:cols - 2], attr)
-                row += 1
-                if row >= rows - 1: break
+            if avail > 0:
+                logs = read_log_tail_filtered(avail)
+                for line in logs:
+                    lo = line.lower()
+                    attr = (C_ERR  if "error" in lo or "erreur" in lo
+                       else C_WARN if "warning" in lo or "warn" in lo
+                       else C_OK   if "info" in lo
+                       else C_NORM)
+                    # Trim timestamp prefix to save space: keep HH:MM:SS + rest
+                    display = line
+                    if len(line) > 23 and line[10] == ' ':
+                        display = line[11:]  # remove date, keep time + rest
+                    put(row, 1, display[:cols - 2], attr)
+                    row += 1
+                    if row >= rows - 1: break
 
+        tick += 1
         stdscr.refresh()
         time.sleep(1.0)
 
