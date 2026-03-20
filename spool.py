@@ -1268,11 +1268,15 @@ class Scanner(threading.Thread):
 
                 # Si le dossier destination existe déjà (résidu d'un crash),
                 # on le supprime — la DB n'a pas d'entrée pour lui (vérifié plus haut).
+                # Note : on re-vérifie juste avant le rename pour éviter la race condition
+                # où dst serait créé entre le check et le move (shutil.move déplacerait
+                # alors la session *dans* dst au lieu de la renommer, produisant
+                # spool/session_X/session_X).
                 if os.path.exists(dst):
                     shutil.rmtree(dst)
                     log.warning("[Scanner] Résidu supprimé dans spool/ : %s", dst)
 
-                shutil.move(session_dir, dst)
+                os.rename(session_dir, dst)
                 size_bytes, file_count = self._dir_size_and_count(dst)
 
                 self.conn.execute(
