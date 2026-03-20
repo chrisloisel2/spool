@@ -21,6 +21,7 @@ import socket
 
 import curses
 import collections
+import concurrent.futures
 
 import paramiko
 
@@ -34,6 +35,7 @@ QUARANTINE_DIR = "/srv/exoria/quarantine"
 DB_PATH = "/srv/exoria/queue.db"
 
 SCAN_INTERVAL = 1  # déjà à 1s — optimal
+SCAN_QC_WORKERS = 8  # threads parallèles pour le quality check
 
 # Nombre de workers NAS en parallèle.
 # 1 = tout dans le thread principal (pas de threads supplémentaires).
@@ -1203,6 +1205,19 @@ class Scanner(threading.Thread):
         except Exception as e:
             log.error("[Scanner] Impossible de mettre en quarantaine '%s' : %s", session_id, e)
 
+    def _qc_one(self, name):
+        """Lance le quality check pour une session. Retourne (name, qr) ou (name, None) si erreur."""
+        session_dir = os.path.join(INBOX_DIR, name)
+        log.info("[Scanner] Quality check en cours : %s", name)
+        tui_log(f"QC {name} …")
+        try:
+            qr = QUALITY_CHECKER.check(session_dir, name)
+            return name, qr
+        except Exception as e:
+            log.error("[Scanner] Erreur inattendue quality check '%s' : %s\n%s",
+                      name, e, traceback.format_exc())
+            return name, None
+
     def scan(self):
         # Cherche les sous-dossiers directs de inbox/ qui matchent session_YYYYMMDD_HHMMSS
         try:
@@ -1211,86 +1226,91 @@ class Scanner(threading.Thread):
             log.error("[Scanner] Impossible de lire inbox : %s", e)
             return
 
+        # Filtre les sessions candidates (pas encore en DB)
+        candidates = []
         for name in entries:
             if not SESSION_RE.match(name):
                 continue
-
             session_dir = os.path.join(INBOX_DIR, name)
             if not os.path.isdir(session_dir):
                 continue
-
-            # Déjà en base ?
             existing = self.conn.execute(
                 "SELECT id FROM jobs WHERE session_id=?", (name,)
             ).fetchone()
-            if existing:
-                continue
+            if not existing:
+                candidates.append(name)
 
-            # ── Quality check (dans inbox/, avant de déplacer) ──────────────
-            log.info("[Scanner] Quality check en cours : %s", name)
-            tui_log(f"QC {name} …")
-            try:
-                qr = QUALITY_CHECKER.check(session_dir, name)
-            except Exception as e:
-                log.error("[Scanner] Erreur inattendue quality check '%s' : %s\n%s",
-                          name, e, traceback.format_exc())
-                # En cas d'erreur interne du checker, on laisse la session en inbox
-                # pour qu'elle soit retraitée au prochain scan.
-                continue
+        if not candidates:
+            return
 
-            if not qr.passed:
-                log.warning("[Scanner] Quality FAIL %s — label=%s errors=%s",
-                            name, qr.label, qr.errors)
-                tui_log(f"QC FAIL {name} [{qr.label}]")
-                self._quarantine_session(session_dir, name, qr.label)
-                # Enregistre en DB comme 'failed' pour traçabilité
-                jid = uuid.uuid4().hex
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO jobs(id,session_dir,session_id,size_bytes,file_count,"
-                    "status,attempts,last_error,created_at,updated_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    (jid, os.path.join(QUARANTINE_DIR, name), name,
-                     0, 0, "failed", 1,
-                     f"quality:{qr.label}:{'; '.join(qr.errors[:3])}",
-                     now_iso(), now_iso()),
-                )
-                self.conn.commit()
-                REPORTER.inc_failed()
-                tui_inc_failed()
-                continue
+        # ── Quality check en parallèle ───────────────────────────────────────
+        with concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_QC_WORKERS) as pool:
+            futures = {pool.submit(self._qc_one, name): name for name in candidates}
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    name, qr = future.result()
+                except Exception as e:
+                    log.error("[Scanner] Future exception : %s", e)
+                    continue
 
-            tui_log(f"QC PASS {name} score={qr.score:.0f}")
+                if qr is None:
+                    # Erreur interne du checker — session laissée en inbox pour retry
+                    continue
 
-            # ── Quality OK → déplace dans spool/ et met en queue ────────────
-            try:
-                jid = uuid.uuid4().hex
-                dst = os.path.join(SPOOL_DIR, name)
+                session_dir = os.path.join(INBOX_DIR, name)
 
-                # Si le dossier destination existe déjà (résidu d'un crash),
-                # on le supprime — la DB n'a pas d'entrée pour lui (vérifié plus haut).
-                # Note : on re-vérifie juste avant le rename pour éviter la race condition
-                # où dst serait créé entre le check et le move (shutil.move déplacerait
-                # alors la session *dans* dst au lieu de la renommer, produisant
-                # spool/session_X/session_X).
-                if os.path.exists(dst):
-                    shutil.rmtree(dst)
-                    log.warning("[Scanner] Résidu supprimé dans spool/ : %s", dst)
+                if not qr.passed:
+                    log.warning("[Scanner] Quality FAIL %s — label=%s errors=%s",
+                                name, qr.label, qr.errors)
+                    tui_log(f"QC FAIL {name} [{qr.label}]")
+                    self._quarantine_session(session_dir, name, qr.label)
+                    jid = uuid.uuid4().hex
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO jobs(id,session_dir,session_id,size_bytes,file_count,"
+                        "status,attempts,last_error,created_at,updated_at) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                        (jid, os.path.join(QUARANTINE_DIR, name), name,
+                         0, 0, "failed", 1,
+                         f"quality:{qr.label}:{'; '.join(qr.errors[:3])}",
+                         now_iso(), now_iso()),
+                    )
+                    self.conn.commit()
+                    REPORTER.inc_failed()
+                    tui_inc_failed()
+                    continue
 
-                os.rename(session_dir, dst)
-                size_bytes, file_count = self._dir_size_and_count(dst)
+                tui_log(f"QC PASS {name} score={qr.score:.0f}")
 
-                self.conn.execute(
-                    "INSERT INTO jobs(id,session_dir,session_id,size_bytes,file_count,status,attempts,last_error,created_at,updated_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    (jid, dst, name, size_bytes, file_count, "queued", 0, "", now_iso(), now_iso()),
-                )
-                self.conn.commit()
+                # ── Quality OK → déplace dans spool/ et met en queue ────────
+                try:
+                    jid = uuid.uuid4().hex
+                    dst = os.path.join(SPOOL_DIR, name)
 
-                log.info("[Scanner] Session mise en file : %s (%d fichiers, %.1f MB) score=%.0f [job=%s]",
-                         name, file_count, size_bytes / (1024*1024), qr.score, jid[:8])
+                    if os.path.exists(dst):
+                        shutil.rmtree(dst)
+                        log.warning("[Scanner] Résidu supprimé dans spool/ : %s", dst)
 
-            except Exception as e:
-                log.error("[Scanner] Impossible d'enregistrer la session '%s' : %s\n%s", name, e, traceback.format_exc())
+                    # session_dir peut avoir bougé si un autre thread a déjà traité
+                    # une session du même nom (race) — on vérifie avant rename
+                    if not os.path.isdir(session_dir):
+                        log.warning("[Scanner] Session '%s' disparue avant enregistrement, ignorée.", name)
+                        continue
+
+                    os.rename(session_dir, dst)
+                    size_bytes, file_count = self._dir_size_and_count(dst)
+
+                    self.conn.execute(
+                        "INSERT INTO jobs(id,session_dir,session_id,size_bytes,file_count,status,attempts,last_error,created_at,updated_at) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                        (jid, dst, name, size_bytes, file_count, "queued", 0, "", now_iso(), now_iso()),
+                    )
+                    self.conn.commit()
+
+                    log.info("[Scanner] Session mise en file : %s (%d fichiers, %.1f MB) score=%.0f [job=%s]",
+                             name, file_count, size_bytes / (1024*1024), qr.score, jid[:8])
+
+                except Exception as e:
+                    log.error("[Scanner] Impossible d'enregistrer la session '%s' : %s\n%s", name, e, traceback.format_exc())
 
         # Mise à jour reporter + TUI
         try:
