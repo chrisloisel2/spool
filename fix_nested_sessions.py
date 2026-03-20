@@ -236,6 +236,27 @@ def cmd_status_errors(db_path):
     return 0
 
 
+def cmd_purge_failed(db_path, apply):
+    """Supprime de la DB tous les jobs failed dont le dossier n'existe plus sur disque."""
+    try:
+        conn = sqlite3.connect(db_path, timeout=30)
+    except Exception as e:
+        print(f"[ERREUR] DB : {e}")
+        return 1
+    rows = conn.execute("SELECT id, session_dir FROM jobs WHERE status='failed'").fetchall()
+    to_delete = [jid for jid, sd in rows if not (sd and os.path.isdir(sd))]
+    print(f"{len(to_delete)} / {len(rows)} jobs failed sans dossier sur disque.")
+    if not apply:
+        print("Dry-run — ajoutez --apply pour supprimer.")
+        conn.close()
+        return 0
+    conn.execute(f"DELETE FROM jobs WHERE status='failed' AND id IN ({','.join('?'*len(to_delete))})", to_delete)
+    conn.commit()
+    conn.close()
+    print(f"{len(to_delete)} entrées supprimées.")
+    return 0
+
+
 def cmd_inspect(db_path, session_id):
     """Affiche l'entrée DB complète d'une session."""
     try:
@@ -331,6 +352,9 @@ if __name__ == "__main__":
         sys.exit(cmd_status(DB_PATH))
     if len(sys.argv) >= 2 and sys.argv[1] == "status-errors":
         sys.exit(cmd_status_errors(DB_PATH))
+    if len(sys.argv) >= 2 and sys.argv[1] == "purge-failed":
+        apply = "--apply" in sys.argv
+        sys.exit(cmd_purge_failed(DB_PATH, apply))
     if len(sys.argv) >= 3 and sys.argv[1] == "inspect":
         sys.exit(cmd_inspect(DB_PATH, sys.argv[2]))
     if len(sys.argv) >= 2 and sys.argv[1] == "status-recoverable":
