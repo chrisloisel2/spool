@@ -322,11 +322,16 @@ def main(stdscr):
 
     daemon_start = None
     try:
-        with open(LOG_FILE, "rb") as f:
-            header = f.read(300).decode("utf-8", errors="replace")
-        first_lines = [l for l in header.splitlines() if l.strip()]
-        if first_lines:
-            daemon_start = dt.datetime.strptime(first_lines[0][:19], "%Y-%m-%d %H:%M:%S").timestamp()
+        pid = int(open(PID_FILE).read().strip())
+        # /proc/<pid>/stat field 22 = starttime en jiffies depuis boot
+        with open(f"/proc/{pid}/stat") as f:
+            fields = f.read().split()
+        jiffies = int(fields[21])
+        hz = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+        with open("/proc/uptime") as f:
+            boot_uptime = float(f.read().split()[0])
+        proc_uptime = boot_uptime - jiffies / hz
+        daemon_start = time.time() - proc_uptime
     except Exception:
         daemon_start = time.time()
 
