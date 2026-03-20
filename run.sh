@@ -70,16 +70,7 @@ is_running() {
 }
 
 start_daemon() {
-    # Tue toutes les instances spool.py existantes avant de démarrer
-    local existing
-    existing=$(pgrep -f "python.*spool\.py" 2>/dev/null || true)
-    if [[ -n "$existing" ]]; then
-        warn "Instance(s) existante(s) détectée(s) (pid: $existing) — arrêt forcé..."
-        kill $existing 2>/dev/null || true
-        sleep 2
-        kill -9 $existing 2>/dev/null || true
-    fi
-    rm -f "$PID_FILE"
+    kill_all_instances
 
     # Crée les répertoires nécessaires
     mkdir -p /srv/exoria/inbox /srv/exoria/spool /srv/exoria/quarantine
@@ -107,30 +98,34 @@ start_daemon() {
     fi
 }
 
-stop_daemon() {
-    if ! is_running; then
-        warn "spool n'est pas en cours d'exécution."
-        return 0
+kill_all_instances() {
+    # Tue tous les run.sh et spool.py en cours sauf nous-mêmes
+    local self=$$
+
+    local run_pids spool_pids
+    run_pids=$(pgrep -f "bash.*run\.sh" 2>/dev/null | grep -v "^${self}$" || true)
+    spool_pids=$(pgrep -f "python.*spool\.py" 2>/dev/null || true)
+
+    local all_pids="${run_pids} ${spool_pids}"
+    all_pids=$(echo "$all_pids" | tr ' ' '\n' | grep -v '^$' | sort -u)
+
+    if [[ -n "$all_pids" ]]; then
+        warn "Instances existantes détectées (pids: $(echo $all_pids | tr '\n' ' ')) — arrêt..."
+        echo "$all_pids" | xargs kill 2>/dev/null || true
+        sleep 2
+        # SIGKILL sur les survivants
+        local survivors
+        survivors=$(echo "$all_pids" | xargs -I{} sh -c 'kill -0 {} 2>/dev/null && echo {}' 2>/dev/null || true)
+        if [[ -n "$survivors" ]]; then
+            echo "$survivors" | xargs kill -9 2>/dev/null || true
+        fi
+        ok "Toutes les instances arrêtées."
     fi
-    local pid
-    pid=$(cat "$PID_FILE")
-    info "Arrêt du daemon (pid=$pid)..."
-    kill "$pid" 2>/dev/null || true
-
-    # Attend jusqu'à 10s
-    local i=0
-    while kill -0 "$pid" 2>/dev/null && [[ $i -lt 10 ]]; do
-        sleep 1; (( i++ ))
-    done
-
-    if kill -0 "$pid" 2>/dev/null; then
-        warn "Le process résiste, envoi de SIGKILL..."
-        kill -9 "$pid" 2>/dev/null || true
-    fi
-
     rm -f "$PID_FILE"
-    ok "Daemon arrêté."
-    kafka_emit "daemon" "stopped" "{\"pid\": $pid}"
+}
+
+stop_daemon() {
+    kill_all_instances
 }
 
 show_status() {
