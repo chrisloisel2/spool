@@ -1194,34 +1194,7 @@ class Scanner(threading.Thread):
 
     def _quarantine_session(self, session_dir: str, session_id: str, reason: str):
         """Envoie une session failed sur le NAS (quarantine) puis supprime localement."""
-        if COPY_TO_NAS_QUARANTINE:
-            try:
-                nas = NASClient()
-                nas.connect()
-                remote_base = posixpath.join(QUARANTINE_ZONE.rstrip("/"), session_id)
-                nas.mkdir_p(remote_base)
-                for root, _, files in os.walk(session_dir):
-                    for fname in files:
-                        local_abs = os.path.join(root, fname)
-                        rel = os.path.relpath(local_abs, session_dir).replace(os.sep, "/")
-                        remote_path = posixpath.join(remote_base, rel)
-                        nas.put_atomic(local_abs, remote_path)
-                nas.close()
-                log.warning("[Scanner] Session '%s' envoyée en quarantaine NAS : %s — %s", session_id, remote_base, reason)
-                tui_log(f"QUARANTINE→NAS {session_id} [{reason}]")
-            except Exception as e:
-                log.error("[Scanner] Erreur envoi quarantaine NAS '%s' : %s", session_id, e)
-                # En cas d'échec NAS, on garde localement
-                try:
-                    os.makedirs(QUARANTINE_DIR, exist_ok=True)
-                    dst = os.path.join(QUARANTINE_DIR, session_id)
-                    if os.path.exists(dst):
-                        dst = dst + f"_dup_{int(time.time())}"
-                    shutil.move(session_dir, dst)
-                except Exception as e2:
-                    log.error("[Scanner] Impossible de mettre en quarantaine locale '%s' : %s", session_id, e2)
-                return
-        else:
+        if not COPY_TO_NAS_QUARANTINE:
             try:
                 os.makedirs(QUARANTINE_DIR, exist_ok=True)
                 dst = os.path.join(QUARANTINE_DIR, session_id)
@@ -1230,16 +1203,49 @@ class Scanner(threading.Thread):
                 shutil.move(session_dir, dst)
                 log.warning("[Scanner] Session '%s' mise en quarantaine locale : %s", session_id, reason)
                 tui_log(f"QUARANTINE {session_id} — {reason}")
-                return
             except Exception as e:
                 log.error("[Scanner] Impossible de mettre en quarantaine '%s' : %s", session_id, e)
-                return
+            return
 
-        # Suppression locale après envoi NAS réussi
+        remote_base = posixpath.join(QUARANTINE_ZONE.rstrip("/"), session_id)
+        nas = NASClient()
+        success = False
+        for attempt in range(1, 4):
+            try:
+                nas.connect()
+                nas.mkdir_p(remote_base)
+                for root, _, files in os.walk(session_dir):
+                    for fname in files:
+                        local_abs = os.path.join(root, fname)
+                        rel = os.path.relpath(local_abs, session_dir).replace(os.sep, "/")
+                        nas.put_atomic(local_abs, posixpath.join(remote_base, rel))
+                success = True
+                break
+            except Exception as e:
+                log.warning("[Scanner] Quarantine NAS tentative %d/3 échouée '%s' : %s", attempt, session_id, e)
+                nas.close()
         try:
-            shutil.rmtree(session_dir)
-        except Exception as e:
-            log.warning("[Scanner] Suppression locale quarantaine '%s' échouée : %s", session_id, e)
+            nas.close()
+        except Exception:
+            pass
+
+        if success:
+            log.warning("[Scanner] Session '%s' envoyée en quarantaine NAS — %s", session_id, reason)
+            tui_log(f"QUARANTINE→NAS {session_id} [{reason}]")
+            try:
+                shutil.rmtree(session_dir)
+            except Exception as e:
+                log.warning("[Scanner] Suppression locale quarantaine '%s' échouée : %s", session_id, e)
+        else:
+            log.error("[Scanner] Quarantine NAS échouée '%s' — fallback local", session_id)
+            try:
+                os.makedirs(QUARANTINE_DIR, exist_ok=True)
+                dst = os.path.join(QUARANTINE_DIR, session_id)
+                if os.path.exists(dst):
+                    dst = dst + f"_dup_{int(time.time())}"
+                shutil.move(session_dir, dst)
+            except Exception as e2:
+                log.error("[Scanner] Fallback quarantaine locale échoué '%s' : %s", session_id, e2)
 
     def _qc_one(self, name):
         """Lance le quality check pour une session. Retourne (name, qr) ou (name, None) si erreur."""
