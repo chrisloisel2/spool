@@ -1168,6 +1168,77 @@ class QualityChecker:
 
 QUALITY_CHECKER = QualityChecker()
 
+# Pool global pour les uploads quarantaine NAS (partagé scanner + workers)
+QUARANTINE_POOL = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="quarantine"
+)
+
+def quarantine_to_nas(session_dir: str, session_id: str, reason: str):
+    """Soumet un upload quarantaine NAS en background. Retour immédiat."""
+    if not COPY_TO_NAS_QUARANTINE:
+        try:
+            os.makedirs(QUARANTINE_DIR, exist_ok=True)
+            dst = os.path.join(QUARANTINE_DIR, session_id)
+            if os.path.exists(dst):
+                dst = dst + f"_dup_{int(time.time())}"
+            shutil.move(session_dir, dst)
+            log.warning("[Quarantine] '%s' → local : %s", session_id, reason)
+        except Exception as e:
+            log.error("[Quarantine] Echec local '%s' : %s", session_id, e)
+        return
+    log.info("[Quarantine] Soumission NAS background : %s [%s]", session_id, reason)
+    QUARANTINE_POOL.submit(_quarantine_upload_bg, session_dir, session_id, reason)
+
+def _quarantine_upload_bg(session_dir: str, session_id: str, reason: str):
+    """Upload NAS quarantaine — tourne dans QUARANTINE_POOL."""
+    remote_base = posixpath.join(QUARANTINE_ZONE.rstrip("/"), session_id)
+    all_files = []
+    for root, _, files in os.walk(session_dir):
+        for fname in files:
+            local_abs = os.path.join(root, fname)
+            rel = os.path.relpath(local_abs, session_dir).replace(os.sep, "/")
+            all_files.append((local_abs, posixpath.join(remote_base, rel)))
+
+    nas = NASClient()
+    success = False
+    for attempt in range(1, 4):
+        try:
+            nas.connect()
+            nas.mkdir_p(remote_base)
+            for local_abs, remote_path in all_files:
+                if nas.exists(remote_path):
+                    continue
+                nas.put_atomic(local_abs, remote_path)
+            success = True
+            break
+        except Exception as e:
+            log.warning("[Quarantine] NAS tentative %d/3 échouée '%s' : %s", attempt, session_id, e)
+            try: nas.close()
+            except Exception: pass
+    try:
+        nas.close()
+    except Exception:
+        pass
+
+    if success:
+        log.warning("[Quarantine] '%s' → NAS OK [%s]", session_id, reason)
+        tui_log(f"QNAS OK {session_id}")
+        try:
+            shutil.rmtree(session_dir)
+        except Exception as e:
+            log.warning("[Quarantine] Suppression locale '%s' échouée : %s", session_id, e)
+    else:
+        log.error("[Quarantine] NAS échouée '%s' — fallback local", session_id)
+        try:
+            os.makedirs(QUARANTINE_DIR, exist_ok=True)
+            dst = os.path.join(QUARANTINE_DIR, session_id)
+            if os.path.exists(dst):
+                dst = dst + f"_dup_{int(time.time())}"
+            if os.path.isdir(session_dir):
+                shutil.move(session_dir, dst)
+        except Exception as e2:
+            log.error("[Quarantine] Fallback local échoué '%s' : %s", session_id, e2)
+
 # =========================
 # SCANNER
 # =========================
@@ -1176,10 +1247,6 @@ class Scanner(threading.Thread):
     def __init__(self, conn):
         super().__init__(daemon=True, name="scanner")
         self.conn = conn
-        # Pool dédié aux uploads quarantaine NAS (ne bloque pas le scanner)
-        self._quarantine_pool = concurrent.futures.ThreadPoolExecutor(
-            max_workers=4, thread_name_prefix="quarantine"
-        )
 
     def run(self):
         log.info("[Scanner] Démarrage — surveillance du dossier : %s", INBOX_DIR)
@@ -1201,81 +1268,6 @@ class Scanner(threading.Thread):
                 except Exception:
                     pass
         return total_bytes, count
-
-    def _quarantine_session(self, session_dir: str, session_id: str, reason: str):
-        """
-        Soumet l'upload quarantaine au pool de threads dédié — retour immédiat,
-        ne bloque pas le scanner ni les workers.
-        """
-        if not COPY_TO_NAS_QUARANTINE:
-            # Quarantaine locale synchrone (pas de NAS) — rapide, OK dans le scanner
-            try:
-                os.makedirs(QUARANTINE_DIR, exist_ok=True)
-                dst = os.path.join(QUARANTINE_DIR, session_id)
-                if os.path.exists(dst):
-                    dst = dst + f"_dup_{int(time.time())}"
-                shutil.move(session_dir, dst)
-                log.warning("[Scanner] Session '%s' mise en quarantaine locale : %s", session_id, reason)
-                tui_log(f"QUARANTINE {session_id} — {reason}")
-            except Exception as e:
-                log.error("[Scanner] Impossible de mettre en quarantaine '%s' : %s", session_id, e)
-            return
-
-        # Upload NAS soumis en background — le scanner continue immédiatement
-        log.info("[Scanner] Quarantaine NAS soumise en background : %s [%s]", session_id, reason)
-        self._quarantine_pool.submit(self._quarantine_upload_bg, session_dir, session_id, reason)
-
-    def _quarantine_upload_bg(self, session_dir: str, session_id: str, reason: str):
-        """Upload NAS quarantaine en arrière-plan (thread pool dédié)."""
-        remote_base = posixpath.join(QUARANTINE_ZONE.rstrip("/"), session_id)
-        # Collecte tous les fichiers une seule fois avant de démarrer
-        all_files = []
-        for root, _, files in os.walk(session_dir):
-            for fname in files:
-                local_abs = os.path.join(root, fname)
-                rel = os.path.relpath(local_abs, session_dir).replace(os.sep, "/")
-                all_files.append((local_abs, posixpath.join(remote_base, rel)))
-
-        nas = NASClient()
-        success = False
-        for attempt in range(1, 4):
-            try:
-                nas.connect()
-                nas.mkdir_p(remote_base)
-                for local_abs, remote_path in all_files:
-                    # Skip si déjà présent sur le NAS (idempotent au retry)
-                    if nas.exists(remote_path):
-                        log.debug("[Quarantine] Skip déjà présent : %s", os.path.basename(remote_path))
-                        continue
-                    nas.put_atomic(local_abs, remote_path)
-                success = True
-                break
-            except Exception as e:
-                log.warning("[Quarantine] NAS tentative %d/3 échouée '%s' : %s", attempt, session_id, e)
-                try: nas.close()
-                except Exception: pass
-        try:
-            nas.close()
-        except Exception:
-            pass
-
-        if success:
-            log.warning("[Quarantine] '%s' envoyée NAS — %s", session_id, reason)
-            tui_log(f"QUARANTINE→NAS OK {session_id}")
-            try:
-                shutil.rmtree(session_dir)
-            except Exception as e:
-                log.warning("[Quarantine] Suppression locale '%s' échouée : %s", session_id, e)
-        else:
-            log.error("[Quarantine] NAS échouée '%s' — fallback local", session_id)
-            try:
-                os.makedirs(QUARANTINE_DIR, exist_ok=True)
-                dst = os.path.join(QUARANTINE_DIR, session_id)
-                if os.path.exists(dst):
-                    dst = dst + f"_dup_{int(time.time())}"
-                shutil.move(session_dir, dst)
-            except Exception as e2:
-                log.error("[Quarantine] Fallback local échoué '%s' : %s", session_id, e2)
 
     def _qc_one(self, name):
         """Lance le quality check pour une session. Retourne (name, qr) ou (name, None) si erreur."""
@@ -1341,7 +1333,20 @@ class Scanner(threading.Thread):
                     continue
 
                 if qr is None:
-                    # Erreur interne du checker — session laissée en inbox pour retry
+                    # Erreur interne du checker — quarantaine NAS
+                    log.error("[Scanner] QC crash '%s' — envoi en quarantaine NAS", name)
+                    quarantine_to_nas(os.path.join(INBOX_DIR, name), name, "qc_crash")
+                    jid = uuid.uuid4().hex
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO jobs(id,session_dir,session_id,size_bytes,file_count,"
+                        "status,attempts,last_error,created_at,updated_at) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                        (jid, os.path.join(QUARANTINE_DIR, name), name,
+                         0, 0, "failed", 1, "quality:qc_crash", now_iso(), now_iso()),
+                    )
+                    self.conn.commit()
+                    REPORTER.inc_failed()
+                    tui_inc_failed()
                     continue
 
                 session_dir = os.path.join(INBOX_DIR, name)
@@ -1350,7 +1355,7 @@ class Scanner(threading.Thread):
                     log.warning("[Scanner] Quality FAIL %s — label=%s errors=%s",
                                 name, qr.label, qr.errors)
                     tui_log(f"QC FAIL {name} [{qr.label}]")
-                    self._quarantine_session(session_dir, name, qr.label)
+                    quarantine_to_nas(session_dir, name, qr.label)
                     jid = uuid.uuid4().hex
                     self.conn.execute(
                         "INSERT OR IGNORE INTO jobs(id,session_dir,session_id,size_bytes,file_count,"
@@ -1604,26 +1609,11 @@ class Worker(threading.Thread):
                 time.sleep(RETRY_BACKOFF)
                 return
 
-            try:
-                os.makedirs(QUARANTINE_DIR, exist_ok=True)
-                q = os.path.join(QUARANTINE_DIR, session_id)
-
-                if os.path.isdir(session_dir):
-                    shutil.move(session_dir, q)
-                    log.warning("[JOB %s] Session '%s' mise en quarantaine locale : %s", jid[:8], session_id, q)
-
-                if COPY_TO_NAS_QUARANTINE and os.path.isdir(q):
-                    remote_q_base = posixpath.join(SFTP_BASE_DIR.rstrip("/"), QUARANTINE_ZONE, session_id)
-                    log.warning("[JOB %s] Envoi quarantaine NAS : %s", jid[:8], remote_q_base)
-                    for local_abs, rel_posix in self._collect_files(q):
-                        remote_path = posixpath.join(remote_q_base, rel_posix)
-                        try:
-                            self._nas_call(f"QUARANTINE:{rel_posix}", self.nas.put_atomic, local_abs, remote_path)
-                        except Exception:
-                            pass
-
-            except Exception as e2:
-                log.error("[JOB %s] Echec mise en quarantaine : %s\n%s", jid[:8], e2, traceback.format_exc())
+            if os.path.isdir(session_dir):
+                log.warning("[JOB %s] Session '%s' → quarantaine NAS (échec après %d tentatives)",
+                            jid[:8], session_id, attempts)
+                # Utilise le même pool de quarantaine que le scanner
+                quarantine_to_nas(session_dir, session_id, f"worker_failed:{err[:80]}")
 
             self.conn.execute(
                 "UPDATE jobs SET status='failed', attempts=?, last_error=?, updated_at=? WHERE id=?",
