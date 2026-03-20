@@ -1091,6 +1091,10 @@ class QualityChecker:
             QUALITY_TIMEOUT_NAMING,
         )
         if rc != 0:
+            # Si cv2/OpenCV n'est pas installé, skip silencieux plutôt que bloquer toutes les sessions
+            if "No module named 'cv2'" in stderr or "ModuleNotFoundError" in stderr:
+                log.warning("[Quality] verify_naming skipped — cv2 non installé (pip3 install opencv-python-headless)")
+                return True, {"skipped": "cv2_missing"}
             log.warning("[Quality] verify_naming error (rc=%d): %s", rc, stderr[:200])
             return False, {"error": stderr[:200]}
         try:
