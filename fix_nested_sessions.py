@@ -215,7 +215,30 @@ def cmd_status(db_path):
     return 0
 
 
+def cmd_status_errors(db_path):
+    """Top 20 des erreurs parmi les jobs failed."""
+    try:
+        conn = sqlite3.connect(db_path, timeout=30)
+    except Exception as e:
+        print(f"[ERREUR] DB : {e}")
+        return 1
+    # Préfixe d'erreur (avant le 1er ':' ou les 60 premiers chars)
+    rows = conn.execute(
+        "SELECT last_error, COUNT(*) as n FROM jobs WHERE status='failed' "
+        "GROUP BY last_error ORDER BY n DESC LIMIT 20"
+    ).fetchall()
+    conn.close()
+    print(f"{'Occurrences':>12}  Erreur")
+    print("─" * 80)
+    for err, n in rows:
+        short = (err or "(vide)")[:100]
+        print(f"{n:>12}  {short}")
+    return 0
+
+
 if __name__ == "__main__":
     if len(sys.argv) == 2 and sys.argv[1] == "status":
         sys.exit(cmd_status(DB_PATH))
+    if len(sys.argv) == 2 and sys.argv[1] == "status-errors":
+        sys.exit(cmd_status_errors(DB_PATH))
     sys.exit(main())
