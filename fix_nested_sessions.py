@@ -236,9 +236,77 @@ def cmd_status_errors(db_path):
     return 0
 
 
+def cmd_status_recoverable(db_path):
+    """Liste les jobs failed dont le dossier session existe encore sur disque → requeables."""
+    try:
+        conn = sqlite3.connect(db_path, timeout=30)
+    except Exception as e:
+        print(f"[ERREUR] DB : {e}")
+        return 1
+    rows = conn.execute(
+        "SELECT id, session_dir, session_id, last_error, attempts FROM jobs WHERE status='failed' ORDER BY session_id"
+    ).fetchall()
+    conn.close()
+
+    recoverable = []
+    for jid, session_dir, session_id, last_error, attempts in rows:
+        if session_dir and os.path.isdir(session_dir):
+            recoverable.append((jid, session_dir, session_id, last_error, attempts))
+
+    print(f"Jobs failed avec dossier encore présent sur disque : {len(recoverable)} / {len(rows)}")
+    if recoverable:
+        print(f"\n{'Session':<30} {'Attempts':>8}  Erreur")
+        print("─" * 90)
+        for jid, session_dir, session_id, last_error, attempts in recoverable[:50]:
+            short_err = (last_error or "")[:50]
+            print(f"{session_id:<30} {attempts:>8}  {short_err}")
+        if len(recoverable) > 50:
+            print(f"  ... et {len(recoverable) - 50} autres")
+        print(f"\nPour les remettre en queue : python3 fix_nested_sessions.py requeue-failed [--apply]")
+    return 0
+
+
+def cmd_requeue_failed(db_path, apply):
+    """Remet en 'queued' les jobs failed dont le dossier existe encore."""
+    try:
+        conn = sqlite3.connect(db_path, timeout=30)
+    except Exception as e:
+        print(f"[ERREUR] DB : {e}")
+        return 1
+    rows = conn.execute(
+        "SELECT id, session_dir, session_id FROM jobs WHERE status='failed' ORDER BY session_id"
+    ).fetchall()
+
+    recoverable = [(jid, sd, sid) for jid, sd, sid in rows if sd and os.path.isdir(sd)]
+    print(f"{len(recoverable)} job(s) récupérable(s) trouvé(s).")
+
+    if not apply:
+        print("Dry-run — ajoutez --apply pour remettre en queue.")
+        conn.close()
+        return 0
+
+    ok = 0
+    for jid, _, _ in recoverable:
+        conn.execute(
+            "UPDATE jobs SET status='queued', attempts=0, last_error='', updated_at=? WHERE id=?",
+            (now_iso(), jid)
+        )
+        ok += 1
+
+    conn.commit()
+    conn.close()
+    print(f"{ok} job(s) remis en 'queued'.")
+    return 0
+
+
 if __name__ == "__main__":
-    if len(sys.argv) == 2 and sys.argv[1] == "status":
+    if len(sys.argv) >= 2 and sys.argv[1] == "status":
         sys.exit(cmd_status(DB_PATH))
-    if len(sys.argv) == 2 and sys.argv[1] == "status-errors":
+    if len(sys.argv) >= 2 and sys.argv[1] == "status-errors":
         sys.exit(cmd_status_errors(DB_PATH))
+    if len(sys.argv) >= 2 and sys.argv[1] == "status-recoverable":
+        sys.exit(cmd_status_recoverable(DB_PATH))
+    if len(sys.argv) >= 2 and sys.argv[1] == "requeue-failed":
+        apply = "--apply" in sys.argv
+        sys.exit(cmd_requeue_failed(DB_PATH, apply))
     sys.exit(main())
