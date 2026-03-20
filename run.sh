@@ -70,10 +70,16 @@ is_running() {
 }
 
 start_daemon() {
-    if is_running; then
-        ok "spool est déjà en cours (pid=$(cat "$PID_FILE"))"
-        return 0
+    # Tue toutes les instances spool.py existantes avant de démarrer
+    local existing
+    existing=$(pgrep -f "python.*spool\.py" 2>/dev/null || true)
+    if [[ -n "$existing" ]]; then
+        warn "Instance(s) existante(s) détectée(s) (pid: $existing) — arrêt forcé..."
+        kill $existing 2>/dev/null || true
+        sleep 2
+        kill -9 $existing 2>/dev/null || true
     fi
+    rm -f "$PID_FILE"
 
     # Crée les répertoires nécessaires
     mkdir -p /srv/exoria/inbox /srv/exoria/spool /srv/exoria/quarantine
