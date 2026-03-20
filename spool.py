@@ -35,7 +35,7 @@ QUARANTINE_DIR = "/srv/exoria/quarantine"
 DB_PATH = "/srv/exoria/queue.db"
 
 SCAN_INTERVAL = 0    # pas de pause entre batches si la queue est vide
-SCAN_QC_WORKERS = 8  # threads parallèles pour le quality check
+SCAN_QC_WORKERS = 32 # threads parallèles pour le quality check (fix+files+sanity uniquement, pas ffmpeg)
 SCAN_BATCH_SIZE = 200 # sessions par batch — assez grand pour alimenter 16 workers
 
 # Nombre de workers NAS en parallèle.
@@ -99,8 +99,8 @@ QUALITY_NAMING_MIN = 0.50
 
 # Active/désactive les étapes optionnelles (fixes si False = skip silencieux)
 QUALITY_RUN_FIX     = True   # tente de réparer les petits problèmes avant checks
-QUALITY_RUN_QUALITY = True   # score vidéo ffmpeg (lent)
-QUALITY_RUN_NAMING  = True   # verify_naming OpenCV (lent)
+QUALITY_RUN_QUALITY = False  # score vidéo ffmpeg — DÉSACTIVÉ : trop lent (300s/session), bloque le pipeline
+QUALITY_RUN_NAMING  = False  # verify_naming OpenCV — DÉSACTIVÉ : lent, non critique pour l'upload
 
 # =========================
 # CONFIG KAFKA
