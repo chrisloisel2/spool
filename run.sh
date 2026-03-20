@@ -148,7 +148,7 @@ attach_tui() {
     "$PYTHON" - << 'PYEOF'
 import sys, os, time, curses, collections, sqlite3, datetime as dt
 
-LOG_FILE  = "/srv/exoria/spool.log"
+LOG_FILE  = "/srv/exoria/logs/spool.log"
 DB_PATH   = "/srv/exoria/queue.db"
 PID_FILE  = "/tmp/spool_daemon.pid"
 WORKERS   = 16
