@@ -507,6 +507,7 @@ _tui_active_transfers: dict = {}   # worker_idx -> {session_id, files_done, file
 _tui_done_count    = 0
 _tui_failed_count  = 0
 _tui_queued_count  = 0
+_tui_inbox_count   = 0
 _tui_total_bytes_session = 0       # bytes total de tous les jobs au démarrage
 _tui_bytes_sent_total    = 0       # bytes effectivement envoyés depuis démarrage
 _tui_speed_history: collections.deque = collections.deque(maxlen=10)  # moyennes glissantes MB/s
@@ -538,6 +539,11 @@ def tui_set_queue(n: int, total_bytes: int):
     with _TUI_LOCK:
         _tui_queued_count = n
         _tui_total_bytes_session = total_bytes
+
+def tui_set_inbox(n: int):
+    global _tui_inbox_count
+    with _TUI_LOCK:
+        _tui_inbox_count = n
 
 def tui_push_speed(mbps: float):
     with _TUI_LOCK:
@@ -1268,21 +1274,90 @@ def _quarantine_upload_bg(session_dir: str, session_id: str, reason: str):
 # =========================
 
 class Scanner(threading.Thread):
+    """Scanner pipeline continu :
+      - thread principal  : découverte inbox → soumet dans QC pool
+      - pool QC (8 threads) : quality check → insère en DB → notify workers
+    Les deux étapes tournent en même temps : le scanner découvre pendant que
+    le QC tourne, sans jamais attendre la fin d'un batch entier.
+    """
+
     def __init__(self, conn):
         super().__init__(daemon=True, name="scanner")
         self.conn = conn
+        # Pool QC permanent — pas recréé à chaque batch
+        self._qc_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=SCAN_QC_WORKERS, thread_name_prefix="qc"
+        )
+        # Noms actuellement dans le pipeline QC (soumis mais pas encore traités)
+        self._in_flight: set = set()
+        self._in_flight_lock = threading.Lock()
 
     def run(self):
         log.info("[Scanner] Démarrage — surveillance du dossier : %s", INBOX_DIR)
         while True:
             try:
-                had_work = self.scan()
+                self._discover()
             except Exception as e:
                 log.error("[Scanner] Erreur inattendue : %s\n%s", e, traceback.format_exc())
-                had_work = False
-            # Pause seulement si rien à faire (évite de saturer le CPU à vide)
-            if not had_work:
-                time.sleep(1)
+            time.sleep(0.5)  # boucle de découverte rapide
+
+    def _discover(self):
+        """Découvre les nouvelles sessions et les soumet au pool QC."""
+        try:
+            entries = os.listdir(INBOX_DIR)
+        except Exception as e:
+            log.error("[Scanner] Impossible de lire inbox : %s", e)
+            return
+
+        try:
+            known = set(
+                r[0] for r in self.conn.execute("SELECT session_id FROM jobs").fetchall()
+            )
+        except Exception as e:
+            log.error("[Scanner] Impossible de lire les jobs connus : %s", e)
+            return
+
+        with self._in_flight_lock:
+            in_flight = set(self._in_flight)
+
+        candidates = []
+        for name in sorted(entries):
+            if not SESSION_RE.match(name):
+                continue
+            if name in known or name in in_flight:
+                continue
+            if not os.path.isdir(os.path.join(INBOX_DIR, name)):
+                continue
+            candidates.append(name)
+
+        inbox_pending = len(candidates) + len(in_flight)
+        if candidates:
+            log.info("[Scanner] %d nouvelles sessions découvertes (en_cours=%d)", len(candidates), len(in_flight))
+
+        # Met à jour le compteur inbox TUI
+        try:
+            tui_set_inbox(inbox_pending)
+        except Exception:
+            pass
+
+        # Soumet les nouveaux candidats au pool QC (sans attendre)
+        for name in candidates:
+            with self._in_flight_lock:
+                self._in_flight.add(name)
+            future = self._qc_pool.submit(self._qc_and_enqueue, name)
+            future.add_done_callback(lambda f, n=name: self._on_qc_done(f, n))
+
+    def _on_qc_done(self, future, name):
+        with self._in_flight_lock:
+            self._in_flight.discard(name)
+        # Mise à jour reporter queue (léger)
+        try:
+            rows = self.conn.execute(
+                "SELECT COUNT(*), SUM(size_bytes) FROM jobs WHERE status='queued'"
+            ).fetchone()
+            tui_set_queue(rows[0] or 0, rows[1] or 0)
+        except Exception:
+            pass
 
     def _dir_size_and_count(self, path: str):
         total_bytes = 0
@@ -1296,167 +1371,91 @@ class Scanner(threading.Thread):
                     pass
         return total_bytes, count
 
-    def _qc_one(self, name):
-        """Lance le quality check pour une session. Retourne (name, qr) ou (name, None) si erreur."""
+    def _qc_and_enqueue(self, name):
+        """Tourne dans le pool QC : check + insert DB + notify workers."""
         session_dir = os.path.join(INBOX_DIR, name)
         log.info("[Scanner] Quality check en cours : %s", name)
         tui_log(f"QC {name} …")
+
         try:
             qr = QUALITY_CHECKER.check(session_dir, name)
-            return name, qr
         except Exception as e:
             log.error("[Scanner] Erreur inattendue quality check '%s' : %s\n%s",
                       name, e, traceback.format_exc())
-            return name, None
+            qr = None
 
-    def scan(self) -> bool:
-        """Retourne True si un batch a été traité, False si rien à faire."""
-        # Cherche les sous-dossiers directs de inbox/ qui matchent session_YYYYMMDD_HHMMSS
-        try:
-            entries = os.listdir(INBOX_DIR)
-        except Exception as e:
-            log.error("[Scanner] Impossible de lire inbox : %s", e)
-            return False
-
-        # Récupère tous les session_id déjà connus en une seule requête
-        try:
-            known = set(
-                r[0] for r in self.conn.execute("SELECT session_id FROM jobs").fetchall()
+        if qr is None:
+            log.error("[Scanner] QC crash '%s' — envoi en quarantaine NAS", name)
+            quarantine_to_nas(os.path.join(INBOX_DIR, name), name, "qc_crash")
+            jid = uuid.uuid4().hex
+            self.conn.execute(
+                "INSERT OR IGNORE INTO jobs(id,session_dir,session_id,size_bytes,file_count,"
+                "status,attempts,last_error,created_at,updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (jid, os.path.join(QUARANTINE_DIR, name), name,
+                 0, 0, "failed", 1, "quality:qc_crash", now_iso(), now_iso()),
             )
-        except Exception as e:
-            log.error("[Scanner] Impossible de lire les jobs connus : %s", e)
-            return False
+            self.conn.commit()
+            REPORTER.inc_failed()
+            tui_inc_failed()
+            return
 
-        # Filtre les sessions candidates (pas encore en DB)
-        candidates = []
-        for name in sorted(entries):
-            if not SESSION_RE.match(name):
-                continue
-            if name in known:
-                continue
-            session_dir = os.path.join(INBOX_DIR, name)
-            if not os.path.isdir(session_dir):
-                continue
-            candidates.append(name)
+        if not qr.passed:
+            log.warning("[Scanner] Quality FAIL %s — label=%s errors=%s",
+                        name, qr.label, qr.errors)
+            tui_log(f"QC FAIL {name} [{qr.label}]")
+            quarantine_to_nas(session_dir, name, qr.label)
+            jid = uuid.uuid4().hex
+            self.conn.execute(
+                "INSERT OR IGNORE INTO jobs(id,session_dir,session_id,size_bytes,file_count,"
+                "status,attempts,last_error,created_at,updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (jid, os.path.join(QUARANTINE_DIR, name), name,
+                 0, 0, "failed", 1,
+                 f"quality:{qr.label}:{'; '.join(qr.errors[:3])}",
+                 now_iso(), now_iso()),
+            )
+            self.conn.commit()
+            REPORTER.inc_failed()
+            tui_inc_failed()
+            return
 
-        inbox_pending = len(candidates)
-        if inbox_pending:
-            log.info("[Scanner] %d sessions en attente dans inbox (batch=%d)", inbox_pending, SCAN_BATCH_SIZE)
-            tui_log(f"INBOX {inbox_pending} sessions à traiter")
+        tui_log(f"QC PASS {name} score={qr.score:.0f}")
 
-        if not candidates:
-            return False
-
-        # Traite par batch pour insérer en DB progressivement et laisser les workers démarrer
-        batch = candidates[:SCAN_BATCH_SIZE]
-
-        # ── Quality check en parallèle ───────────────────────────────────────
-        with concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_QC_WORKERS) as pool:
-            futures = {pool.submit(self._qc_one, name): name for name in batch}
-            for future in concurrent.futures.as_completed(futures):
-                try:
-                    name, qr = future.result()
-                except Exception as e:
-                    log.error("[Scanner] Future exception : %s", e)
-                    continue
-
-                if qr is None:
-                    # Erreur interne du checker — quarantaine NAS
-                    log.error("[Scanner] QC crash '%s' — envoi en quarantaine NAS", name)
-                    quarantine_to_nas(os.path.join(INBOX_DIR, name), name, "qc_crash")
-                    jid = uuid.uuid4().hex
-                    self.conn.execute(
-                        "INSERT OR IGNORE INTO jobs(id,session_dir,session_id,size_bytes,file_count,"
-                        "status,attempts,last_error,created_at,updated_at) "
-                        "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                        (jid, os.path.join(QUARANTINE_DIR, name), name,
-                         0, 0, "failed", 1, "quality:qc_crash", now_iso(), now_iso()),
-                    )
-                    self.conn.commit()
-                    REPORTER.inc_failed()
-                    tui_inc_failed()
-                    continue
-
-                session_dir = os.path.join(INBOX_DIR, name)
-
-                if not qr.passed:
-                    log.warning("[Scanner] Quality FAIL %s — label=%s errors=%s",
-                                name, qr.label, qr.errors)
-                    tui_log(f"QC FAIL {name} [{qr.label}]")
-                    quarantine_to_nas(session_dir, name, qr.label)
-                    jid = uuid.uuid4().hex
-                    self.conn.execute(
-                        "INSERT OR IGNORE INTO jobs(id,session_dir,session_id,size_bytes,file_count,"
-                        "status,attempts,last_error,created_at,updated_at) "
-                        "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                        (jid, os.path.join(QUARANTINE_DIR, name), name,
-                         0, 0, "failed", 1,
-                         f"quality:{qr.label}:{'; '.join(qr.errors[:3])}",
-                         now_iso(), now_iso()),
-                    )
-                    self.conn.commit()
-                    REPORTER.inc_failed()
-                    tui_inc_failed()
-                    continue
-
-                tui_log(f"QC PASS {name} score={qr.score:.0f}")
-
-                # ── Quality OK → déplace dans spool/ et met en queue ────────
-                try:
-                    jid = uuid.uuid4().hex
-                    dst = os.path.join(SPOOL_DIR, name)
-
-                    if os.path.exists(dst):
-                        shutil.rmtree(dst)
-                        log.warning("[Scanner] Résidu supprimé dans spool/ : %s", dst)
-
-                    # session_dir peut avoir bougé si un autre thread a déjà traité
-                    # une session du même nom (race) — on vérifie avant rename
-                    if not os.path.isdir(session_dir):
-                        log.warning("[Scanner] Session '%s' disparue avant enregistrement, ignorée.", name)
-                        continue
-
-                    os.rename(session_dir, dst)
-                    size_bytes, file_count = self._dir_size_and_count(dst)
-
-                    self.conn.execute(
-                        "INSERT INTO jobs(id,session_dir,session_id,size_bytes,file_count,status,attempts,last_error,created_at,updated_at) "
-                        "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                        (jid, dst, name, size_bytes, file_count, "queued", 0, "", now_iso(), now_iso()),
-                    )
-                    self.conn.commit()
-
-                    # Réveille les workers en attente dès qu'un job est disponible
-                    with JOB_AVAILABLE:
-                        JOB_AVAILABLE.notify_all()
-
-                    log.info("[Scanner] Session mise en file : %s (%d fichiers, %.1f MB) score=%.0f [job=%s]",
-                             name, file_count, size_bytes / (1024*1024), qr.score, jid[:8])
-
-                except Exception as e:
-                    log.error("[Scanner] Impossible d'enregistrer la session '%s' : %s\n%s", name, e, traceback.format_exc())
-
-        # Mise à jour reporter + TUI
+        # Quality OK → déplace dans spool/ et met en queue
         try:
-            rows = self.conn.execute(
-                "SELECT id, session_id, size_bytes, file_count, created_at FROM jobs WHERE status='queued' ORDER BY created_at ASC"
-            ).fetchall()
-            queue = [
-                {
-                    "session_id": r[1],
-                    "size_mb": round((r[2] or 0) / (1024*1024), 2),
-                    "file_count": r[3],
-                    "received_at": r[4],
-                }
-                for r in rows
-            ]
-            REPORTER.set_inbound_queue(queue)
-            total_q_bytes = sum((r[2] or 0) for r in rows)
-            tui_set_queue(len(rows), total_q_bytes)
-        except Exception as e:
-            log.debug("[Scanner] Reporter queue update failed: %s", e)
+            jid = uuid.uuid4().hex
+            dst = os.path.join(SPOOL_DIR, name)
 
-        return True
+            if os.path.exists(dst):
+                shutil.rmtree(dst)
+                log.warning("[Scanner] Résidu supprimé dans spool/ : %s", dst)
+
+            if not os.path.isdir(session_dir):
+                log.warning("[Scanner] Session '%s' disparue avant enregistrement, ignorée.", name)
+                return
+
+            os.rename(session_dir, dst)
+            size_bytes, file_count = self._dir_size_and_count(dst)
+
+            self.conn.execute(
+                "INSERT INTO jobs(id,session_dir,session_id,size_bytes,file_count,"
+                "status,attempts,last_error,created_at,updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (jid, dst, name, size_bytes, file_count, "queued", 0, "", now_iso(), now_iso()),
+            )
+            self.conn.commit()
+
+            # Réveille les workers immédiatement
+            with JOB_AVAILABLE:
+                JOB_AVAILABLE.notify_all()
+
+            log.info("[Scanner] Session mise en file : %s (%d fichiers, %.1f MB) score=%.0f [job=%s]",
+                     name, file_count, size_bytes / (1024*1024), qr.score, jid[:8])
+
+        except Exception as e:
+            log.error("[Scanner] Impossible d'enregistrer la session '%s' : %s\n%s",
+                      name, e, traceback.format_exc())
 
 # =========================
 # WORKER — NAS persistent + reconnect/backoff
