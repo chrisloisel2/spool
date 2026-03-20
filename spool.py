@@ -1193,6 +1193,10 @@ QUARANTINE_POOL = concurrent.futures.ThreadPoolExecutor(
     max_workers=4, thread_name_prefix="quarantine"
 )
 
+# Condition signalée par le scanner chaque fois qu'il insère de nouveaux jobs.
+# Les workers l'attendent au lieu de poll à intervalle fixe → 0 idle inutile.
+JOB_AVAILABLE = threading.Condition()
+
 def quarantine_to_nas(session_dir: str, session_id: str, reason: str):
     """Soumet un upload quarantaine NAS en background. Retour immédiat."""
     if not COPY_TO_NAS_QUARANTINE:
@@ -1422,6 +1426,10 @@ class Scanner(threading.Thread):
                     )
                     self.conn.commit()
 
+                    # Réveille les workers en attente dès qu'un job est disponible
+                    with JOB_AVAILABLE:
+                        JOB_AVAILABLE.notify_all()
+
                     log.info("[Scanner] Session mise en file : %s (%d fichiers, %.1f MB) score=%.0f [job=%s]",
                              name, file_count, size_bytes / (1024*1024), qr.score, jid[:8])
 
@@ -1499,7 +1507,10 @@ class Worker(threading.Thread):
         while True:
             job = self.get_job()
             if not job:
-                time.sleep(0.2)  # TURBO: poll plus fréquent (200ms au lieu de 1s)
+                # Attend que le scanner signale un nouveau job (max 1s de timeout
+                # pour rester robuste si le signal est manqué)
+                with JOB_AVAILABLE:
+                    JOB_AVAILABLE.wait(timeout=1.0)
                 continue
             self.process(job)
 
