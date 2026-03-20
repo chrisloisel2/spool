@@ -1227,17 +1227,26 @@ class Scanner(threading.Thread):
     def _quarantine_upload_bg(self, session_dir: str, session_id: str, reason: str):
         """Upload NAS quarantaine en arrière-plan (thread pool dédié)."""
         remote_base = posixpath.join(QUARANTINE_ZONE.rstrip("/"), session_id)
+        # Collecte tous les fichiers une seule fois avant de démarrer
+        all_files = []
+        for root, _, files in os.walk(session_dir):
+            for fname in files:
+                local_abs = os.path.join(root, fname)
+                rel = os.path.relpath(local_abs, session_dir).replace(os.sep, "/")
+                all_files.append((local_abs, posixpath.join(remote_base, rel)))
+
         nas = NASClient()
         success = False
         for attempt in range(1, 4):
             try:
                 nas.connect()
                 nas.mkdir_p(remote_base)
-                for root, _, files in os.walk(session_dir):
-                    for fname in files:
-                        local_abs = os.path.join(root, fname)
-                        rel = os.path.relpath(local_abs, session_dir).replace(os.sep, "/")
-                        nas.put_atomic(local_abs, posixpath.join(remote_base, rel))
+                for local_abs, remote_path in all_files:
+                    # Skip si déjà présent sur le NAS (idempotent au retry)
+                    if nas.exists(remote_path):
+                        log.debug("[Quarantine] Skip déjà présent : %s", os.path.basename(remote_path))
+                        continue
+                    nas.put_atomic(local_abs, remote_path)
                 success = True
                 break
             except Exception as e:
