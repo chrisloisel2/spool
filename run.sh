@@ -565,13 +565,58 @@ case "$CMD" in
         echo ""
         tail -f "$LOG_FILE" | grep --line-buffered "\[Spool\]"
         ;;
+    reset)
+        banner
+        warn "RESET COMPLET : arrêt du daemon + purge DB + remise en inbox des sessions spool/"
+        echo ""
+
+        # 1. Arrêt
+        stop_daemon
+        sleep 1
+
+        # 2. Remet les sessions de spool/ dans inbox/ (sessions en cours interrompues)
+        SPOOL_DIR="/srv/exoria/spool"
+        INBOX_DIR="/srv/exoria/inbox"
+        n_moved=0
+        if [[ -d "$SPOOL_DIR" ]]; then
+            for d in "$SPOOL_DIR"/session_*/; do
+                [[ -d "$d" ]] || continue
+                name=$(basename "$d")
+                dst="$INBOX_DIR/$name"
+                if [[ -d "$dst" ]]; then
+                    warn "Conflit $name déjà dans inbox — suppression de la copie spool"
+                    rm -rf "$d"
+                else
+                    mv "$d" "$dst"
+                    (( n_moved++ )) || true
+                fi
+            done
+        fi
+        ok "$n_moved session(s) remise(s) dans inbox/"
+
+        # 3. Purge de la DB
+        DB="/srv/exoria/queue.db"
+        if [[ -f "$DB" ]]; then
+            rm -f "$DB" "${DB}-wal" "${DB}-shm"
+            ok "Base de données supprimée"
+        else
+            info "Pas de DB à supprimer"
+        fi
+
+        # 4. Redémarrage propre
+        echo ""
+        info "Redémarrage..."
+        sleep 1
+        start_daemon
+        attach_tui
+        ;;
     run|"")
         banner
         start_daemon
         attach_tui
         ;;
     *)
-        echo "Usage: $0 [run|stop|restart|status|logs|watch]"
+        echo "Usage: $0 [run|stop|restart|status|logs|watch|reset]"
         exit 1
         ;;
 esac
