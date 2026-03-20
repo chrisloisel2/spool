@@ -1324,24 +1324,33 @@ class Worker(threading.Thread):
         self.nas = NASClient()
 
     def get_job(self):
-        row = self.conn.execute(
-            "SELECT id,session_dir,session_id,size_bytes,file_count,attempts "
-            "FROM jobs WHERE status='queued' ORDER BY created_at ASC LIMIT 1"
-        ).fetchone()
-        if not row:
+        # BEGIN EXCLUSIVE garantit qu'un seul worker à la fois peut sélectionner
+        # et marquer un job, évitant que plusieurs workers prennent le même job.
+        try:
+            self.conn.execute("BEGIN EXCLUSIVE")
+        except Exception:
             return None
 
-        jid = row[0]
-        self.conn.execute(
-            "UPDATE jobs SET status='processing', updated_at=? WHERE id=? AND status='queued'",
-            (now_iso(), jid),
-        )
-        self.conn.commit()
+        try:
+            row = self.conn.execute(
+                "SELECT id,session_dir,session_id,size_bytes,file_count,attempts "
+                "FROM jobs WHERE status='queued' ORDER BY created_at ASC LIMIT 1"
+            ).fetchone()
+            if not row:
+                self.conn.execute("ROLLBACK")
+                return None
 
-        # Vérifie qu'on a bien pris le lock
-        if not self.conn.execute(
-            "SELECT 1 FROM jobs WHERE id=? AND status='processing'", (jid,)
-        ).fetchone():
+            jid = row[0]
+            self.conn.execute(
+                "UPDATE jobs SET status='processing', updated_at=? WHERE id=?",
+                (now_iso(), jid),
+            )
+            self.conn.execute("COMMIT")
+        except Exception:
+            try:
+                self.conn.execute("ROLLBACK")
+            except Exception:
+                pass
             return None
 
         log.debug("[Worker-%d] Job %s pris en charge.", self.idx, jid[:8])
@@ -1573,6 +1582,22 @@ def main():
         )
         conn.commit()
         log.warning("[App] %d job(s) figé(s) en 'processing' remis en file.", stuck)
+
+    # Purge des jobs queued/processing dont le dossier n'existe plus sur disque
+    orphans = conn.execute(
+        "SELECT id, session_dir, session_id FROM jobs WHERE status IN ('queued','processing')"
+    ).fetchall()
+    purged = 0
+    for jid, session_dir, session_id in orphans:
+        if not session_dir or not os.path.isdir(session_dir):
+            conn.execute(
+                "UPDATE jobs SET status='failed', last_error='dossier introuvable au démarrage', updated_at=? WHERE id=?",
+                (now_iso(), jid),
+            )
+            purged += 1
+    if purged:
+        conn.commit()
+        log.warning("[App] %d job(s) sans dossier sur disque marqués failed.", purged)
 
     REPORTER.set_db(conn)
     REPORTER.start()
