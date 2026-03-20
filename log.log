@@ -1,76 +1,67 @@
- ⚡ SPOOL  ·  16 workers  ·  NAS 192.168.88.82  ·  PID 969974  ·  up 1h35m
-───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-  ✓ done    23761   ⧖ queue      0    ⚙ actifs   0    ✗ échecs   288  📥 inbox 18446
-───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-  Envoi   ███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████ 100.0% 760.3 GB / 760
+
+
+ ⚡ SPOOL  ·  16 workers  ·  NAS 192.168.88.82  ·  PID 986131  ·  up 1h55m
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ✓ done    23761   ⧖ queue      0    ⚙ actifs   0    ✗ échecs   295  📥 inbox 18440
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Envoi   ███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████ 100.0% 760.3 GB / 760
   Vitesse    0.0 MB/s     restant 0 B           ETA --:--
-───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-  Scanner  —  inbox: 18446 sessions en attente
-╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
-  17:42:28  [Scanner] Quality check en cours : session_20260310_043932
-  17:42:28  [Quality] Début quality check — session=session_20260310_043932
-  17:42:28  [Scanner] Quality check en cours : session_20260310_044052
-  17:42:28  [Quality] Début quality check — session=session_20260310_044052
-  17:42:28  [Scanner] Quality check en cours : session_20260310_044146
-  17:42:28  [Quality] Début quality check — session=session_20260310_044146
-  17:42:28  [Scanner] Quality check en cours : session_20260310_044248
-  17:42:28  [Quality] Début quality check — session=session_20260310_044248
-───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Scanner  —  inbox: 18440 sessions en attente
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+  18:02:01  [Scanner] Quality check en cours : session_20260310_044436
+  18:02:01  [Quality] Début quality check — session=session_20260310_044436
+  18:02:01  [Scanner] Quality check en cours : session_20260310_044522
+  18:02:01  [Quality] Début quality check — session=session_20260310_044522
+  18:02:01  [Scanner] Quality check en cours : session_20260310_044602
+  18:02:01  [Quality] Début quality check — session=session_20260310_044602
+  18:02:01  [Scanner] Quality check en cours : session_20260310_044611
+  18:02:01  [Quality] Début quality check — session=session_20260310_044611
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
   Transferts NAS  0/16 actifs
-╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
     (aucun transfert actif)
-───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
   Logs  (q = quitter)
-  [Spool] up=00h07m38s  queued=0 (0.0 MB)  processing=0  done=23761  failed=288  xfer=idle
+ r [Spool] up=00h05m39s  queued=0 (0.0 MB)  processing=0  done=23761  failed=295  xfer=idle
  ^[[24;1H^[[?1049l^[[23;0;0t
- ^[[?1l^[>2026-03-20 17:42:28,117 INFO MainThread [App] Démarrage — inbox=/srv/exoria/inbox  spool=/srv/exoria/spool  quarantine=/srv/exoria/quarantine  db=/srv/exoria/queue.db
- 17:42:28,117 INFO MainThread [App] Mode : 16 worker(s)
- ^[[?1049h^[[22;0;0t^[[1;24r^[(B^[[m^[[4l^[[?7h^[[?1l^[>2026-03-20 17:42:28,242 INFO MainThread [App] Démarrage en mode multi-thread (16 workers).
- 17:42:28,262 INFO scanner [Scanner] Démarrage — surveillance du dossier : /srv/exoria/inbox
- 17:42:28,265 INFO worker-1 [Worker-1] Démarrage.
- 17:42:28,269 INFO worker-2 [Worker-2] Démarrage.
- 17:42:28,286 INFO worker-3 [Worker-3] Démarrage.
- 17:42:28,297 INFO worker-4 [Worker-4] Démarrage.
- 17:42:28,310 INFO worker-5 [Worker-5] Démarrage.
- 17:42:28,329 INFO worker-6 [Worker-6] Démarrage.
- 17:42:28,369 INFO worker-7 [Worker-7] Démarrage.
- 17:42:28,389 INFO worker-8 [Worker-8] Démarrage.
- 17:42:28,438 INFO worker-9 [Worker-9] Démarrage.
- 17:42:28,445 INFO worker-10 [Worker-10] Démarrage.
- 17:42:28,451 INFO worker-11 [Worker-11] Démarrage.
- 17:42:28,465 INFO worker-12 [Worker-12] Démarrage.
- 17:42:28,477 INFO worker-13 [Worker-13] Démarrage.
- 17:42:28,493 INFO worker-14 [Worker-14] Démarrage.
- 17:42:28,497 INFO worker-15 [Worker-15] Démarrage.
- 17:42:28,541 INFO worker-16 [Worker-16] Démarrage.
- 17:42:28,574 INFO scanner [Scanner] 13843 sessions en attente dans inbox (batch=50)
- 17:42:28,632 INFO ThreadPoolExecutor-0_0 [Scanner] Quality check en cours : session_20260308_161838
- 17:42:28,633 INFO ThreadPoolExecutor-0_0 [Quality] Début quality check — session=session_20260308_161838
- 17:42:28,640 INFO ThreadPoolExecutor-0_1 [Scanner] Quality check en cours : session_20260310_034255
- 17:42:28,640 INFO ThreadPoolExecutor-0_1 [Quality] Début quality check — session=session_20260310_034255
- 17:42:28,649 INFO ThreadPoolExecutor-0_2 [Scanner] Quality check en cours : session_20260310_042628
- 17:42:28,650 INFO ThreadPoolExecutor-0_2 [Quality] Début quality check — session=session_20260310_042628
- 17:42:28,673 INFO ThreadPoolExecutor-0_3 [Scanner] Quality check en cours : session_20260310_043916
- 17:42:28,673 INFO ThreadPoolExecutor-0_3 [Quality] Début quality check — session=session_20260310_043916
- 17:42:28,690 INFO ThreadPoolExecutor-0_4 [Scanner] Quality check en cours : session_20260310_043932
- 17:42:28,695 INFO ThreadPoolExecutor-0_4 [Quality] Début quality check — session=session_20260310_043932
- 17:42:28,728 INFO ThreadPoolExecutor-0_5 [Scanner] Quality check en cours : session_20260310_044052
- 17:42:28,728 INFO ThreadPoolExecutor-0_5 [Quality] Début quality check — session=session_20260310_044052
- 17:42:28,789 INFO ThreadPoolExecutor-0_6 [Scanner] Quality check en cours : session_20260310_044146
- 17:42:28,789 INFO ThreadPoolExecutor-0_6 [Quality] Début quality check — session=session_20260310_044146
- 17:42:28,805 INFO ThreadPoolExecutor-0_7 [Scanner] Quality check en cours : session_20260310_044248
- 17:42:28,806 INFO ThreadPoolExecutor-0_7 [Quality] Début quality check — session=session_20260310_044248
-
-
-
-
-
-
-
-
-
-
-
+ ^[[?1l^[>2026-03-20 18:02:01,545 INFO MainThread [App] Démarrage — inbox=/srv/exoria/inbox  spool=/srv/exoria/spool  quarantine=/srv/exoria/quarantine  db=/srv/exoria/queue.db
+ 18:02:01,545 INFO MainThread [App] Mode : 16 worker(s)
+ ^[[?1049h^[[22;0;0t^[[1;24r^[(B^[[m^[[4l^[[?7h^[[?1l^[>2026-03-20 18:02:01,585 INFO MainThread [App] Démarrage en mode multi-thread (16 workers).
+ 18:02:01,599 INFO scanner [Scanner] Démarrage — surveillance du dossier : /srv/exoria/inbox
+ 18:02:01,600 INFO worker-1 [Worker-1] Démarrage.
+ 18:02:01,609 INFO worker-2 [Worker-2] Démarrage.
+ 18:02:01,614 INFO worker-3 [Worker-3] Démarrage.
+ 18:02:01,625 INFO worker-4 [Worker-4] Démarrage.
+ 18:02:01,640 INFO worker-5 [Worker-5] Démarrage.
+ 18:02:01,641 INFO worker-6 [Worker-6] Démarrage.
+ 18:02:01,673 INFO worker-7 [Worker-7] Démarrage.
+ 18:02:01,681 INFO worker-8 [Worker-8] Démarrage.
+ 18:02:01,708 INFO scanner [Scanner] 13836 sessions en attente dans inbox (batch=50)
+ 18:02:01,708 INFO worker-9 [Worker-9] Démarrage.
+ 18:02:01,709 INFO ThreadPoolExecutor-0_0 [Scanner] Quality check en cours : session_20260310_034255
+ 18:02:01,709 INFO ThreadPoolExecutor-0_0 [Quality] Début quality check — session=session_20260310_034255
+ 18:02:01,712 INFO ThreadPoolExecutor-0_1 [Scanner] Quality check en cours : session_20260310_042628
+ 18:02:01,736 INFO worker-10 [Worker-10] Démarrage.
+ 18:02:01,738 INFO ThreadPoolExecutor-0_1 [Quality] Début quality check — session=session_20260310_042628
+ 18:02:01,750 INFO worker-11 [Worker-11] Démarrage.
+ 18:02:01,751 INFO worker-12 [Worker-12] Démarrage.
+ 18:02:01,753 INFO worker-13 [Worker-13] Démarrage.
+ 18:02:01,757 INFO ThreadPoolExecutor-0_2 [Scanner] Quality check en cours : session_20260310_043916
+ 18:02:01,757 INFO ThreadPoolExecutor-0_2 [Quality] Début quality check — session=session_20260310_043916
+ 18:02:01,774 INFO ThreadPoolExecutor-0_3 [Scanner] Quality check en cours : session_20260310_044333
+ 18:02:01,774 INFO ThreadPoolExecutor-0_3 [Quality] Début quality check — session=session_20260310_044333
+ 18:02:01,776 INFO worker-14 [Worker-14] Démarrage.
+ 18:02:01,797 INFO worker-15 [Worker-15] Démarrage.
+ 18:02:01,798 INFO ThreadPoolExecutor-0_4 [Scanner] Quality check en cours : session_20260310_044436
+ 18:02:01,798 INFO ThreadPoolExecutor-0_4 [Quality] Début quality check — session=session_20260310_044436
+ 18:02:01,803 INFO worker-16 [Worker-16] Démarrage.
+ 18:02:01,804 INFO ThreadPoolExecutor-0_5 [Scanner] Quality check en cours : session_20260310_044522
+ 18:02:01,804 INFO ThreadPoolExecutor-0_5 [Quality] Début quality check — session=session_20260310_044522
+ 18:02:01,820 INFO ThreadPoolExecutor-0_6 [Scanner] Quality check en cours : session_20260310_044602
+ 18:02:01,820 INFO ThreadPoolExecutor-0_6 [Quality] Début quality check — session=session_20260310_044602
+ 18:02:01,834 INFO ThreadPoolExecutor-0_7 [Scanner] Quality check en cours : session_20260310_044611
+ 18:02:01,837 INFO ThreadPoolExecutor-0_7 [Quality] Début quality check — session=session_20260310_044611
 
 
 
