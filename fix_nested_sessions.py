@@ -199,5 +199,23 @@ def main():
     return 0 if fail == 0 else 1
 
 
+def cmd_status(db_path):
+    """Affiche un résumé de la DB sans sqlite3 CLI."""
+    try:
+        conn = sqlite3.connect(db_path, timeout=30)
+    except Exception as e:
+        print(f"[ERREUR] DB : {e}")
+        return 1
+    rows = conn.execute("SELECT status, COUNT(*) FROM jobs GROUP BY status ORDER BY status").fetchall()
+    conn.close()
+    print(f"{'Status':<12} {'Count':>8}")
+    print("─" * 22)
+    for status, count in rows:
+        print(f"{status:<12} {count:>8}")
+    return 0
+
+
 if __name__ == "__main__":
+    if len(sys.argv) == 2 and sys.argv[1] == "status":
+        sys.exit(cmd_status(DB_PATH))
     sys.exit(main())
