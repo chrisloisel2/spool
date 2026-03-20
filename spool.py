@@ -943,9 +943,26 @@ class NASClient:
         tmp = remote + ".part"
         log.info("[NAS] Envoi '%s' (%d octets)...", os.path.basename(local), size)
 
-        # putfo avec buffer 4 MB — bien plus rapide que sftp.put (évite les micro-lectures)
+        # Écriture par chunks de 32 MB pour laisser le keepalive SSH fonctionner
+        # et éviter les drops de connexion sur les gros fichiers vidéo
+        CHUNK = 32 * 1024 * 1024  # 32 MB
         with open(local, "rb", buffering=SFTP_READ_BUFFER) as fh:
-            self.sftp.putfo(fh, tmp, file_size=size)
+            with self.sftp.open(tmp, "wb") as rh:
+                rh.set_pipelined(True)
+                sent = 0
+                while True:
+                    chunk = fh.read(CHUNK)
+                    if not chunk:
+                        break
+                    rh.write(chunk)
+                    sent += len(chunk)
+                    # Keepalive manuel entre chunks
+                    try:
+                        tr = self.ssh.get_transport()
+                        if tr:
+                            tr.send_ignore()
+                    except Exception:
+                        pass
 
         log.info("[NAS] Transfert OK '%s'", os.path.basename(local))
 
