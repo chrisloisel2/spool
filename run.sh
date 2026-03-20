@@ -206,34 +206,76 @@ def db_stats():
         return dict(queued=0, processing=0, done=0, failed=0,
                     total_b=0, sent_b=0, remaining_b=0)
 
-def read_log_speed():
-    """Lit la vitesse instantanée depuis les dernières lignes du log."""
+def read_log_tail_raw(n_bytes=None, n_lines=None):
+    """Retourne les dernières lignes non-vides du log."""
     try:
         size = os.path.getsize(LOG_FILE)
+        read_bytes = n_bytes or LOG_TAIL_BYTES
         with open(LOG_FILE, "rb") as f:
-            f.seek(max(0, size - 8000))
-            tail = f.read().decode("utf-8", errors="replace").splitlines()
-        for line in reversed(tail):
-            if "@ " in line and "MB/s" in line:
-                try:
-                    return float(line.split("@ ")[1].split(" MB/s")[0])
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    return 0.0
-
-def read_log_tail(n):
-    """Retourne les n dernières lignes non-vides du log."""
-    try:
-        size = os.path.getsize(LOG_FILE)
-        with open(LOG_FILE, "rb") as f:
-            f.seek(max(0, size - LOG_TAIL_BYTES))
+            f.seek(max(0, size - read_bytes))
             raw = f.read().decode("utf-8", errors="replace")
         lines = [l for l in raw.splitlines() if l.strip()]
-        return lines[-n:]
+        if n_lines:
+            return lines[-n_lines:]
+        return lines
     except Exception as e:
         return [f"[erreur lecture log: {e}]"]
+
+def parse_worker_states():
+    """
+    Parse le log pour extraire l'état de chaque worker actif.
+    Retourne dict: session_id -> {files_done, file_count, speed_mbps, current_file, last_seen}
+    Format log: [JOB xxxxxxxx] N/M 'path' @ X.X MB/s
+    """
+    lines = read_log_tail_raw(n_bytes=64000)
+    workers = {}
+    import re
+    pat = re.compile(r'\[JOB ([0-9a-f]+)\]\s+(\d+)/(\d+)\s+\'([^\']+)\'\s+@\s+([\d.]+)\s+MB/s')
+    for line in lines:
+        m = pat.search(line)
+        if m:
+            jid, done, total, fname, spd = m.group(1), int(m.group(2)), int(m.group(3)), m.group(4), float(m.group(5))
+            # Cherche session_id associé au job dans les lignes précédentes
+            workers[jid] = {"files_done": done, "file_count": total,
+                            "current_file": fname, "speed_mbps": spd}
+    # Associe session_id depuis les lignes "Session '...' — N fichiers"
+    pat2 = re.compile(r"\[JOB ([0-9a-f]+)\] Session '([^']+)'")
+    for line in lines:
+        m = pat2.search(line)
+        if m:
+            jid, sid = m.group(1), m.group(2)
+            if jid in workers:
+                workers[jid]["session_id"] = sid
+    # Construit liste indexée par session_id
+    result = {}
+    for jid, w in workers.items():
+        sid = w.get("session_id", jid[:8])
+        result[sid] = w
+    return result
+
+def read_log_speed(lines=None):
+    """Vitesse totale = somme des dernières vitesses par worker actif."""
+    if lines is None:
+        lines = read_log_tail_raw(n_bytes=16000)
+    import re
+    pat = re.compile(r'\[JOB ([0-9a-f]+)\].*@\s+([\d.]+)\s+MB/s')
+    last_speed = {}
+    for line in reversed(lines):
+        m = pat.search(line)
+        if m:
+            jid, spd = m.group(1), float(m.group(2))
+            if jid not in last_speed:
+                last_speed[jid] = spd
+        if len(last_speed) >= WORKERS:
+            break
+    return sum(last_speed.values()) if last_speed else 0.0
+
+def read_log_tail(n):
+    """Retourne les n dernières lignes non-vides du log (pour section logs)."""
+    # Filtre les lignes DEBUG trop verbeuses pour le TUI
+    lines = read_log_tail_raw(n_bytes=LOG_TAIL_BYTES)
+    filtered = [l for l in lines if " DEBUG " not in l]
+    return filtered[-n:]
 
 def main(stdscr):
     curses.curs_set(0)
@@ -329,34 +371,63 @@ def main(stdscr):
         put(row, 48, f"ETA {eta_str}", C_WARN if eta_str != "--:--" else C_NORM)
         row += 1
 
-        # ── WORKERS ──────────────────────────────────────────────────────────
+        # ── WORKERS DÉTAIL ───────────────────────────────────────────────────
         hline(row); row += 1
-        bar_w2   = max(10, cols - 34)
-        proc_pct = st["processing"] / max(WORKERS, 1) * 100
-        put(row, 2, "Workers  ", C_TITLE)
-        put(row, 11, _bar(proc_pct, bar_w2), C_STAT)
-        put(row, 11 + bar_w2 + 1, f"{st['processing']:2d}/{WORKERS}", C_STAT)
-        put(row, 11 + bar_w2 + 8,
-            f"{st['queued']} en attente" if st['queued'] else "idle",
-            C_WARN if st['queued'] else C_NORM)
-        row += 1
-
-        # ── LOGS ─────────────────────────────────────────────────────────────
-        hline(row); row += 1
-        put(row, 2, "Logs  (q = quitter)", C_TITLE); row += 1
+        put(row, 2, f"Transferts actifs  {st['processing']}/{WORKERS}  —  {st['queued']} en attente", C_TITLE); row += 1
         hline(row, "╌"); row += 1
 
-        avail = max(0, rows - row - 1)
-        logs  = read_log_tail(avail) if avail > 0 else []
-        for line in logs:
-            lo = line.lower()
-            attr = (C_ERR  if "error" in lo or " error" in lo
-               else C_WARN if "warning" in lo or "warn" in lo
-               else C_OK   if "info" in lo
-               else C_NORM)
-            put(row, 1, line[:cols - 2], attr)
+        worker_states = parse_worker_states()
+        bar_w2 = max(10, cols - 52)
+
+        # Sessions processing depuis la DB
+        try:
+            conn2 = sqlite3.connect(DB_PATH, timeout=1)
+            proc_rows = conn2.execute(
+                "SELECT session_id, size_bytes, file_count FROM jobs WHERE status='processing' ORDER BY updated_at DESC LIMIT 16"
+            ).fetchall()
+            conn2.close()
+        except Exception:
+            proc_rows = []
+
+        displayed = 0
+        for sid, size_b, fc in proc_rows:
+            if row >= rows - 6: break
+            w = worker_states.get(sid, {})
+            fd    = w.get("files_done", 0)
+            ft    = w.get("file_count", fc or 1)
+            spd   = w.get("speed_mbps", 0.0)
+            fname = w.get("current_file", "…")[-28:]
+            pct   = fd / max(ft, 1) * 100
+            label = sid[-22:].ljust(22)
+            bar   = _bar(pct, bar_w2)
+            put(row, 2,  label, C_NORM)
+            put(row, 25, bar,   C_OK if pct > 50 else C_WARN)
+            put(row, 25 + bar_w2 + 1, f"{pct:5.1f}%", C_STAT)
+            put(row, 25 + bar_w2 + 8, f"{fd:>3}/{ft}f  {spd:.1f}MB/s", C_NORM)
             row += 1
-            if row >= rows - 1: break
+            put(row, 4, f"↳ {fname}", C_NORM); row += 1
+            displayed += 1
+
+        if displayed == 0:
+            put(row, 4, "(aucun transfert actif détecté dans le log)", C_NORM); row += 1
+
+        # ── LOGS ─────────────────────────────────────────────────────────────
+        if row < rows - 4:
+            hline(row); row += 1
+            put(row, 2, "Logs récents  (q = quitter)", C_TITLE); row += 1
+            hline(row, "╌"); row += 1
+
+            avail = max(0, rows - row - 1)
+            logs  = read_log_tail(avail) if avail > 0 else []
+            for line in logs:
+                lo = line.lower()
+                attr = (C_ERR  if "error" in lo
+                   else C_WARN if "warning" in lo or "warn" in lo
+                   else C_OK   if "info" in lo
+                   else C_NORM)
+                put(row, 1, line[:cols - 2], attr)
+                row += 1
+                if row >= rows - 1: break
 
         stdscr.refresh()
         time.sleep(1.0)
