@@ -1203,6 +1203,13 @@ QUARANTINE_POOL = concurrent.futures.ThreadPoolExecutor(
 # Les workers l'attendent au lieu de poll à intervalle fixe → 0 idle inutile.
 JOB_AVAILABLE = threading.Condition()
 
+# Verrou Python pour sérialiser get_job() sans contention SQLite BEGIN EXCLUSIVE.
+# Avec 16 workers en compétition, BEGIN EXCLUSIVE cause une file d'attente SQLite
+# (busy_timeout 60s) : la plupart des workers lèvent une exception et retournent None.
+# Ce verrou Python garantit qu'un seul worker exécute get_job() à la fois,
+# les autres attendent proprement sans exception ni sleep inutile.
+_GET_JOB_LOCK = threading.Lock()
+
 def quarantine_to_nas(session_dir: str, session_id: str, reason: str):
     """Soumet un upload quarantaine NAS en background. Retour immédiat."""
     if not COPY_TO_NAS_QUARANTINE:
@@ -1310,8 +1317,20 @@ class Scanner(threading.Thread):
             return
 
         try:
+            # Exclure uniquement les sessions non-done (queued/processing/failed récents).
+            # Les sessions done sont supprimées localement donc ne seront plus dans inbox.
+            # Charger tous les jobs done (24K+) à chaque cycle est inutile et lent.
             known = set(
-                r[0] for r in self.conn.execute("SELECT session_id FROM jobs").fetchall()
+                r[0] for r in self.conn.execute(
+                    "SELECT session_id FROM jobs WHERE status IN ('queued','processing','failed')"
+                ).fetchall()
+            )
+            # Ajouter aussi les done récents (dernière heure) pour éviter re-soumission
+            # au cas où le dossier serait encore présent temporairement
+            known.update(
+                r[0] for r in self.conn.execute(
+                    "SELECT session_id FROM jobs WHERE status='done' AND updated_at >= datetime('now','-1 hour')"
+                ).fetchall()
             )
         except Exception as e:
             log.error("[Scanner] Impossible de lire les jobs connus : %s", e)
@@ -1353,8 +1372,14 @@ class Scanner(threading.Thread):
         except Exception:
             pass
 
-        # Soumet les nouveaux candidats au pool QC (sans attendre)
-        for name in candidates:
+        # Limite la soumission à SCAN_BATCH_SIZE candidats par cycle :
+        # le pool QC n'a que SCAN_QC_WORKERS slots actifs, inutile de soumettre
+        # 18 000 futures d'un coup — ça gaspille la mémoire et ralentit _discover().
+        # Les candidats non soumis seront redécouverts au prochain cycle (0.5s).
+        batch = candidates[:SCAN_BATCH_SIZE]
+
+        # Soumet les candidats du batch au pool QC (sans attendre)
+        for name in batch:
             with self._in_flight_lock:
                 self._in_flight.add(name)
             future = self._qc_pool.submit(self._qc_and_enqueue, name)
@@ -1482,34 +1507,36 @@ class Worker(threading.Thread):
         self.nas = NASClient()
 
     def get_job(self):
-        # BEGIN EXCLUSIVE garantit qu'un seul worker à la fois peut sélectionner
-        # et marquer un job, évitant que plusieurs workers prennent le même job.
-        try:
-            self.conn.execute("BEGIN EXCLUSIVE")
-        except Exception:
-            return None
-
-        try:
-            row = self.conn.execute(
-                "SELECT id,session_dir,session_id,size_bytes,file_count,attempts "
-                "FROM jobs WHERE status='queued' ORDER BY created_at ASC LIMIT 1"
-            ).fetchone()
-            if not row:
-                self.conn.execute("ROLLBACK")
+        # _GET_JOB_LOCK sérialise l'accès sans contention SQLite :
+        # un seul worker à la fois exécute BEGIN EXCLUSIVE, les autres
+        # attendent proprement sur le verrou Python (pas de timeout/exception).
+        with _GET_JOB_LOCK:
+            try:
+                self.conn.execute("BEGIN EXCLUSIVE")
+            except Exception:
                 return None
 
-            jid = row[0]
-            self.conn.execute(
-                "UPDATE jobs SET status='processing', updated_at=? WHERE id=?",
-                (now_iso(), jid),
-            )
-            self.conn.execute("COMMIT")
-        except Exception:
             try:
-                self.conn.execute("ROLLBACK")
+                row = self.conn.execute(
+                    "SELECT id,session_dir,session_id,size_bytes,file_count,attempts "
+                    "FROM jobs WHERE status='queued' ORDER BY created_at ASC LIMIT 1"
+                ).fetchone()
+                if not row:
+                    self.conn.execute("ROLLBACK")
+                    return None
+
+                jid = row[0]
+                self.conn.execute(
+                    "UPDATE jobs SET status='processing', updated_at=? WHERE id=?",
+                    (now_iso(), jid),
+                )
+                self.conn.execute("COMMIT")
             except Exception:
-                pass
-            return None
+                try:
+                    self.conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                return None
 
         log.debug("[Worker-%d] Job %s pris en charge.", self.idx, jid[:8])
         return row  # (id, session_dir, session_id, size_bytes, file_count, attempts)

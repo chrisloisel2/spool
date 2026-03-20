@@ -290,6 +290,36 @@ fix_tracker_header() {
 }
 
 # ─────────────────────────────────────────────
+# 5. FIX metadata.json : remet failed=false si la session est marquée failed=true
+#    Les sessions enregistrées pendant un crash sont souvent marquées failed=true
+#    mais leurs données sont exploitables.
+# ─────────────────────────────────────────────
+fix_failed_flag() {
+  local session_dir="$1"
+  local metadata="$session_dir/metadata.json"
+
+  [[ -f "$metadata" ]] || return
+
+  local failed_val
+  failed_val="$(python3 -c "import json,sys; d=json.load(open('$metadata')); print(d.get('failed',''))" 2>/dev/null)"
+
+  if [[ "$failed_val" == "True" || "$failed_val" == "true" ]]; then
+    cp "$metadata" "${metadata}.bak"
+    python3 -c "
+import json, sys
+with open('$metadata') as f:
+    d = json.load(f)
+d['failed'] = False
+with open('$metadata', 'w') as f:
+    json.dump(d, f, indent=2)
+" 2>/dev/null && {
+      log_ok "metadata.json : failed=true → false (session potentiellement récupérable)"
+      (( fixed_total++ )) || true
+    } || log_err "Impossible de corriger failed dans metadata.json"
+  fi
+}
+
+# ─────────────────────────────────────────────
 # Traitement d'une session
 # ─────────────────────────────────────────────
 process_session() {
@@ -302,6 +332,9 @@ process_session() {
   else
     log_info "metadata.json présent"
   fi
+
+  # Fix 5 : failed=true dans metadata.json
+  fix_failed_flag "$session_dir" || true
 
   # Fix 2 : JSONL tronqués
   local videos_dir="$session_dir/videos"
