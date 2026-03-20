@@ -151,11 +151,16 @@ CREATE TABLE IF NOT EXISTS jobs (
  attempts INTEGER,
  last_error TEXT,
  created_at TEXT,
- updated_at TEXT
+ updated_at TEXT,
+ dest TEXT DEFAULT 'bronze' -- 'bronze' ou 'quarantine'
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at);
+"""
+
+_DB_MIGRATE = """
+ALTER TABLE jobs ADD COLUMN dest TEXT DEFAULT 'bronze';
 """
 
 SESSION_RE = re.compile(r"^session_\d{8}_\d{6}$")
@@ -167,6 +172,12 @@ def db():
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=60000")   # attend 60s au lieu de lever immédiatement
     conn.executescript(SCHEMA)
+    # Migration : ajoute la colonne dest si elle n'existe pas encore
+    try:
+        conn.execute(_DB_MIGRATE)
+        conn.commit()
+    except Exception:
+        pass  # colonne déjà présente
     return conn
 
 # =========================
@@ -1423,39 +1434,32 @@ class Scanner(threading.Thread):
             qr = None
 
         if qr is None:
-            log.error("[Scanner] QC crash '%s' — envoi en quarantaine NAS", name)
-            quarantine_to_nas(os.path.join(INBOX_DIR, name), name, "qc_crash")
-            jid = uuid.uuid4().hex
-            self.conn.execute(
-                "INSERT OR IGNORE INTO jobs(id,session_dir,session_id,size_bytes,file_count,"
-                "status,attempts,last_error,created_at,updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (jid, os.path.join(QUARANTINE_DIR, name), name,
-                 0, 0, "failed", 1, "quality:qc_crash", now_iso(), now_iso()),
-            )
-            self.conn.commit()
-            REPORTER.inc_failed()
-            tui_inc_failed()
-            return
-
-        if not qr.passed:
+            log.error("[Scanner] QC crash '%s' — mise en queue quarantaine", name)
+            reason = "qc_crash"
+        elif not qr.passed:
             log.warning("[Scanner] Quality FAIL %s — label=%s errors=%s",
                         name, qr.label, qr.errors)
-            tui_log(f"QC FAIL {name} [{qr.label}]")
-            quarantine_to_nas(session_dir, name, qr.label)
+            reason = f"quality:{qr.label}:{'; '.join(qr.errors[:3])}"
+        else:
+            reason = None
+
+        if reason is not None:
+            # Toutes les sessions rejetées par QC sont uploadées en quarantaine NAS
+            # par les workers (pas par un pool séparé) — les 16 workers sont ainsi
+            # occupés en permanence, qu'il s'agisse de bronze ou de quarantaine.
+            tui_log(f"QC✗ {name}  [{reason[:40]}] → quarantaine")
+            size_bytes, file_count = self._dir_size_and_count(session_dir)
             jid = uuid.uuid4().hex
             self.conn.execute(
                 "INSERT OR IGNORE INTO jobs(id,session_dir,session_id,size_bytes,file_count,"
-                "status,attempts,last_error,created_at,updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (jid, os.path.join(QUARANTINE_DIR, name), name,
-                 0, 0, "failed", 1,
-                 f"quality:{qr.label}:{'; '.join(qr.errors[:3])}",
-                 now_iso(), now_iso()),
+                "status,attempts,last_error,created_at,updated_at,dest) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (jid, session_dir, name, size_bytes, file_count,
+                 "queued", 0, reason[:2000], now_iso(), now_iso(), "quarantine"),
             )
             self.conn.commit()
-            REPORTER.inc_failed()
-            tui_inc_failed()
+            with JOB_AVAILABLE:
+                JOB_AVAILABLE.notify_all()
             return
 
         tui_log(f"QC PASS {name} score={qr.score:.0f}")
@@ -1518,7 +1522,7 @@ class Worker(threading.Thread):
 
             try:
                 row = self.conn.execute(
-                    "SELECT id,session_dir,session_id,size_bytes,file_count,attempts "
+                    "SELECT id,session_dir,session_id,size_bytes,file_count,attempts,COALESCE(dest,'bronze') "
                     "FROM jobs WHERE status='queued' ORDER BY created_at ASC LIMIT 1"
                 ).fetchone()
                 if not row:
@@ -1539,7 +1543,7 @@ class Worker(threading.Thread):
                 return None
 
         log.debug("[Worker-%d] Job %s pris en charge.", self.idx, jid[:8])
-        return row  # (id, session_dir, session_id, size_bytes, file_count, attempts)
+        return row  # (id, session_dir, session_id, size_bytes, file_count, attempts, dest)
 
     def run(self):
         log.info("[Worker-%d] Démarrage.", self.idx)
@@ -1579,11 +1583,12 @@ class Worker(threading.Thread):
         return sorted(files, key=lambda x: x[1])
 
     def process(self, job):
-        jid, session_dir, session_id, size_bytes, file_count, attempts_prev = job
+        jid, session_dir, session_id, size_bytes, file_count, attempts_prev, dest = job
         attempts = attempts_prev + 1
+        is_quarantine = (dest == "quarantine")
 
-        log.info("[JOB %s] Session '%s' — %d fichiers, %.1f MB, tentative %d",
-                 jid[:8], session_id, file_count, (size_bytes or 0) / (1024*1024), attempts)
+        log.info("[JOB %s] Session '%s' — %d fichiers, %.1f MB, tentative %d [dest=%s]",
+                 jid[:8], session_id, file_count, (size_bytes or 0) / (1024*1024), attempts, dest)
 
         tui_update_transfer(self.idx, {
             "session_id": session_id,
@@ -1608,8 +1613,11 @@ class Worker(threading.Thread):
             if not files:
                 raise Exception("session vide — aucun fichier trouvé")
 
-            # Dossier NAS cible : /data/INBOX/<session_id>/
-            remote_base = posixpath.join(SFTP_BASE_DIR.rstrip("/"), session_id)
+            # Dossier NAS cible : bronze ou quarantaine selon dest
+            if is_quarantine:
+                remote_base = posixpath.join(QUARANTINE_ZONE.rstrip("/"), session_id)
+            else:
+                remote_base = posixpath.join(SFTP_BASE_DIR.rstrip("/"), session_id)
             self._nas_call("MKDIR_SESSION", self.nas.mkdir_p, remote_base)
 
             t_start = time.monotonic()
@@ -1648,7 +1656,11 @@ class Worker(threading.Thread):
 
             elapsed = max(time.monotonic() - t_start, 0.001)
             speed = round((size_bytes or 0) / (1024*1024) / elapsed, 2)
-            log.info("[JOB %s] Session '%s' envoyée en %.1fs @ %.1f MB/s", jid[:8], session_id, elapsed, speed)
+            if is_quarantine:
+                log.info("[JOB %s] Session '%s' → quarantaine NAS en %.1fs @ %.1f MB/s", jid[:8], session_id, elapsed, speed)
+                tui_log(f"QNAS OK {session_id}")
+            else:
+                log.info("[JOB %s] Session '%s' → bronze NAS en %.1fs @ %.1f MB/s", jid[:8], session_id, elapsed, speed)
 
             self.conn.execute(
                 "UPDATE jobs SET status='done', updated_at=? WHERE id=?",
@@ -1657,18 +1669,19 @@ class Worker(threading.Thread):
             self.conn.commit()
 
             REPORTER.inc_processed()
-            REPORTER.inc_forwarded()
+            if not is_quarantine:
+                REPORTER.inc_forwarded()
+            else:
+                REPORTER.inc_failed()
             REPORTER.set_current_transfer(None)
             tui_update_transfer(self.idx, None)
             tui_inc_done(size_bytes or 0)
 
-            if DELETE_LOCAL_AFTER_SUCCESS:
-                try:
-                    shutil.rmtree(session_dir)
-                    log.info("[JOB %s] Dossier local supprimé : %s", jid[:8], session_dir)
-                    tui_log(f"DELETED {session_id}")
-                except Exception as ce:
-                    log.warning("[JOB %s] Suppression locale échouée : %s — %s", jid[:8], session_dir, ce)
+            try:
+                shutil.rmtree(session_dir)
+                log.info("[JOB %s] Dossier local supprimé : %s", jid[:8], session_dir)
+            except Exception as ce:
+                log.warning("[JOB %s] Suppression locale échouée : %s — %s", jid[:8], session_dir, ce)
 
         except Exception as e:
             err = str(e)
@@ -1685,10 +1698,9 @@ class Worker(threading.Thread):
                 time.sleep(RETRY_BACKOFF)
                 return
 
-            if os.path.isdir(session_dir):
+            if os.path.isdir(session_dir) and not is_quarantine:
                 log.warning("[JOB %s] Session '%s' → quarantaine NAS (échec après %d tentatives)",
                             jid[:8], session_id, attempts)
-                # Utilise le même pool de quarantaine que le scanner
                 quarantine_to_nas(session_dir, session_id, f"worker_failed:{err[:80]}")
 
             self.conn.execute(
