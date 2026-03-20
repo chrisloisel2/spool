@@ -1417,7 +1417,7 @@ class Worker(threading.Thread):
 
             t_start = time.monotonic()
             bytes_sent = 0
-            total_bytes = size_bytes or 1
+            total_bytes = sum(os.path.getsize(f) for f, _ in files) or 1
 
             for i, (local_abs, rel_posix) in enumerate(files):
                 remote_path = posixpath.join(remote_base, rel_posix)
