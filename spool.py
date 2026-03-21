@@ -1228,6 +1228,7 @@ JOB_AVAILABLE = threading.Condition()
 # Ce verrou Python garantit qu'un seul worker exécute get_job() à la fois,
 # les autres attendent proprement sans exception ni sleep inutile.
 _GET_JOB_LOCK = threading.Lock()
+_DB_WRITE_LOCK = threading.Lock()  # serialise toutes les écritures QC → DB
 
 def quarantine_to_nas(session_dir: str, session_id: str, reason: str):
     """Soumet un upload quarantaine NAS en background. Retour immédiat."""
@@ -1492,13 +1493,14 @@ class Scanner(threading.Thread):
             os.rename(session_dir, dst)
             size_bytes, file_count = self._dir_size_and_count(dst)
 
-            self.conn.execute(
-                "INSERT INTO jobs(id,session_dir,session_id,size_bytes,file_count,"
-                "status,attempts,last_error,created_at,updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (jid, dst, name, size_bytes, file_count, "queued", 0, "", now_iso(), now_iso()),
-            )
-            self.conn.commit()
+            with _DB_WRITE_LOCK:
+                self.conn.execute(
+                    "INSERT INTO jobs(id,session_dir,session_id,size_bytes,file_count,"
+                    "status,attempts,last_error,created_at,updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (jid, dst, name, size_bytes, file_count, "queued", 0, "", now_iso(), now_iso()),
+                )
+                self.conn.commit()
 
             # Réveille les workers immédiatement
             with JOB_AVAILABLE:
