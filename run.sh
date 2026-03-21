@@ -2,6 +2,7 @@
 # run.sh — Lance spool comme service permanent, puis affiche le TUI live.
 # Usage : ./run.sh [stop|restart|logs|status]
 set -euo pipefail
+set -x
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
