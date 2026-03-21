@@ -1442,35 +1442,39 @@ class Scanner(threading.Thread):
             qr = None
 
         if qr is None:
-            log.error("[Scanner] QC crash '%s' — mise en queue quarantaine", name)
-            reason = "qc_crash"
+            qc_errors = ["qc_crash"]
+            qc_label  = "qc_crash"
         elif not qr.passed:
             log.warning("[Scanner] Quality FAIL %s — label=%s errors=%s",
                         name, qr.label, qr.errors)
-            reason = f"quality:{qr.label}:{'; '.join(qr.errors[:3])}"
+            qc_errors = qr.errors
+            qc_label  = qr.label
         else:
-            reason = None
+            qc_errors = []
+            qc_label  = None
 
-        if reason is not None:
-            # Toutes les sessions rejetées par QC sont uploadées en quarantaine NAS
-            # par les workers (pas par un pool séparé) — les 16 workers sont ainsi
-            # occupés en permanence, qu'il s'agisse de bronze ou de quarantaine.
-            tui_log(f"QC✗ {name}  [{reason[:40]}] → quarantaine")
-            size_bytes, file_count = self._dir_size_and_count(session_dir)
-            jid = uuid.uuid4().hex
-            self.conn.execute(
-                "INSERT OR IGNORE INTO jobs(id,session_dir,session_id,size_bytes,file_count,"
-                "status,attempts,last_error,created_at,updated_at,dest) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (jid, session_dir, name, size_bytes, file_count,
-                 "queued", 0, reason[:2000], now_iso(), now_iso(), "quarantine"),
-            )
-            self.conn.commit()
-            with JOB_AVAILABLE:
-                JOB_AVAILABLE.notify_all()
-            return
+        if qc_label is not None:
+            # Échec QC : on annote metadata.json et on envoie quand même en inbox (bronze)
+            tui_log(f"QC✗ {name}  [{qc_label}] → inbox (avec erreurs dans metadata)")
+            meta_path = os.path.join(session_dir, "metadata.json")
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+            except Exception:
+                meta = {}
+            meta["qc_failed"]  = True
+            meta["qc_label"]   = qc_label
+            meta["qc_errors"]  = qc_errors
+            try:
+                with open(meta_path, "w", encoding="utf-8") as f:
+                    json.dump(meta, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                log.warning("[Scanner] Impossible d'écrire metadata QC pour '%s' : %s", name, e)
 
-        tui_log(f"QC PASS {name} score={qr.score:.0f}")
+        if qc_label is None:
+            tui_log(f"QC PASS {name} score={qr.score:.0f}")
+        else:
+            log.info("[Scanner] Session '%s' — QC fail (%s), envoi inbox sans quarantaine", name, qc_label)
 
         # Quality OK → déplace dans spool/ et met en queue
         try:

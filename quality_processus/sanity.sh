@@ -195,9 +195,21 @@ check_jsonl() {
           printf("[ERROR] %s.jsonl ligne %d: wall invalide (%s)\n", cam, line_no, ts) > "/dev/stderr"
           exit 1
         }
-        if (prev_ts >= 0 && ts+0 <= prev_ts+0) {
-          printf("[ERROR] %s.jsonl ligne %d: wall non croissant (%s <= %s)\n", cam, line_no, ts, prev_ts) > "/dev/stderr"
-          exit 1
+        # Comparaison haute précision : split sur le point décimal
+        # pour éviter la perte de précision awk sur grands timestamps flottants
+        if (prev_ts >= 0) {
+          split(ts,      ta, ".")
+          split(prev_ts, pa, ".")
+          ts_int = ta[1]+0; ts_dec = (ta[2] != "" ? ta[2] : "0")
+          pt_int = pa[1]+0; pt_dec = (pa[2] != "" ? pa[2] : "0")
+          # Rembourrage à même longueur pour comparaison lexicographique
+          while (length(ts_dec) < length(pt_dec)) ts_dec = ts_dec "0"
+          while (length(pt_dec) < length(ts_dec)) pt_dec = pt_dec "0"
+          not_growing = (ts_int < pt_int) || (ts_int == pt_int && ts_dec <= pt_dec)
+          if (not_growing) {
+            printf("[ERROR] %s.jsonl ligne %d: wall non croissant (%s <= %s)\n", cam, line_no, ts, prev_ts) > "/dev/stderr"
+            exit 1
+          }
         }
       }
 
@@ -213,7 +225,7 @@ check_jsonl() {
       }
 
       prev_idx = idx+0
-      prev_ts  = ts+0
+      prev_ts  = ts
     }
     END {
       if (line_no == 0) {
