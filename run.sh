@@ -2,7 +2,6 @@
 # run.sh — Lance spool comme service permanent, puis affiche le TUI live.
 # Usage : ./run.sh [stop|restart|logs|status]
 set -euo pipefail
-set -x
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -112,7 +111,7 @@ kill_all_instances() {
     fi
 
     local to_kill
-    to_kill=$(echo "$spool_pids" | tr ' ' '\n' | grep -v '^$' | sort -un | tr '\n' ' ')
+    to_kill=$(echo "$spool_pids" | tr ' ' '\n' | grep -v '^$' | sort -un | tr '\n' ' ' || true)
 
     if [[ -n "$to_kill" ]]; then
         warn "Instances existantes détectées (pids: $to_kill) — arrêt..."
