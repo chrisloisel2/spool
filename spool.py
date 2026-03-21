@@ -11,6 +11,7 @@ import shutil
 import hashlib
 import sqlite3
 import logging
+import logging.handlers
 import argparse
 import threading
 import datetime as dt
@@ -118,7 +119,7 @@ except ImportError:
     HAS_KAFKA = False
 
 # =========================
-# LOG (maximum)
+# LOG
 # =========================
 
 LOG_DIR  = "/srv/exoria/logs"
@@ -127,9 +128,16 @@ LOG_FILE = os.path.join(LOG_DIR, "spool.log")
 os.makedirs(LOG_DIR, exist_ok=True)
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s %(levelname)s %(threadName)s %(message)s",
-    handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8")],
+    handlers=[
+        logging.handlers.RotatingFileHandler(
+            LOG_FILE,
+            maxBytes=100 * 1024 * 1024,   # 100 MB par fichier
+            backupCount=5,                 # 5 fichiers max → 500 MB total
+            encoding="utf-8",
+        )
+    ],
 )
 log = logging.getLogger("spool")
 
@@ -1336,11 +1344,12 @@ class Scanner(threading.Thread):
                     "SELECT session_id FROM jobs WHERE status IN ('queued','processing','failed')"
                 ).fetchall()
             )
-            # Ajouter aussi les done récents (dernière heure) pour éviter re-soumission
-            # au cas où le dossier serait encore présent temporairement
+            # Ajouter aussi les done récents (24h) pour éviter re-soumission
+            # si le rmtree a échoué silencieusement et que le dossier est encore présent.
+            # Fenêtre 24h (au lieu de 1h) pour éviter la boucle infinie d'accumulation.
             known.update(
                 r[0] for r in self.conn.execute(
-                    "SELECT session_id FROM jobs WHERE status='done' AND updated_at >= datetime('now','-1 hour')"
+                    "SELECT session_id FROM jobs WHERE status='done' AND updated_at >= datetime('now','-24 hours')"
                 ).fetchall()
             )
         except Exception as e:
@@ -1371,11 +1380,10 @@ class Scanner(threading.Thread):
             candidates.append(name)
 
         inbox_pending = len(candidates) + len(in_flight)
-        log.info("[Scanner] inbox=%d entries=%d known=%d in_flight=%d candidates=%d (skip_known=%d skip_flight=%d skip_nodir=%d nomatch=%d)",
-                 inbox_pending, len(entries), len(known), len(in_flight), len(candidates),
-                 n_skip_known, n_skip_inflight, n_skip_nodir, n_nomatch)
+        # Log seulement s'il y a de nouvelles sessions (évite 172 800 lignes/jour à 0.5s)
         if candidates:
-            log.info("[Scanner] %d nouvelles sessions découvertes (en_cours=%d)", len(candidates), len(in_flight))
+            log.info("[Scanner] %d nouvelles sessions découvertes — inbox=%d in_flight=%d known=%d",
+                     len(candidates), inbox_pending, len(in_flight), len(known))
 
         # Met à jour le compteur inbox TUI
         try:
@@ -1677,11 +1685,19 @@ class Worker(threading.Thread):
             tui_update_transfer(self.idx, None)
             tui_inc_done(size_bytes or 0)
 
-            try:
-                shutil.rmtree(session_dir)
-                log.info("[JOB %s] Dossier local supprimé : %s", jid[:8], session_dir)
-            except Exception as ce:
-                log.warning("[JOB %s] Suppression locale échouée : %s — %s", jid[:8], session_dir, ce)
+            # Suppression locale — plusieurs tentatives pour éviter l'accumulation
+            # si un fichier est temporairement verrouillé (ex: scan en cours).
+            for _del_attempt in range(3):
+                try:
+                    shutil.rmtree(session_dir)
+                    log.info("[JOB %s] Dossier local supprimé : %s", jid[:8], session_dir)
+                    break
+                except Exception as ce:
+                    if _del_attempt < 2:
+                        time.sleep(1)
+                    else:
+                        log.error("[JOB %s] SUPPRESSION LOCALE IMPOSSIBLE après 3 tentatives : %s — %s",
+                                  jid[:8], session_dir, ce)
 
         except Exception as e:
             err = str(e)

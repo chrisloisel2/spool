@@ -99,27 +99,28 @@ start_daemon() {
 }
 
 kill_all_instances() {
-    # Tue tous les run.sh et spool.py en cours sauf nous-mêmes
-    local self=$$
-
-    local run_pids spool_pids
-    run_pids=$(pgrep -f "bash.*run\.sh" 2>/dev/null | grep -v "^${self}$" || true)
+    # Tuer uniquement les processus spool.py (pas bash run.sh — trop risqué de se tuer soi-même)
+    local spool_pids
     spool_pids=$(pgrep -f "python.*spool\.py" 2>/dev/null || true)
 
-    local all_pids="${run_pids} ${spool_pids}"
-    all_pids=$(echo "$all_pids" | tr ' ' '\n' | grep -v '^$' | sort -u)
+    # Aussi tuer le daemon enregistré dans le PID file s'il existe
+    if [[ -f "$PID_FILE" ]]; then
+        local saved_pid
+        saved_pid=$(cat "$PID_FILE" 2>/dev/null || true)
+        [[ -n "$saved_pid" ]] && spool_pids="$spool_pids $saved_pid"
+    fi
 
-    if [[ -n "$all_pids" ]]; then
-        warn "Instances existantes détectées (pids: $(echo $all_pids | tr '\n' ' ')) — arrêt..."
-        echo "$all_pids" | xargs kill 2>/dev/null || true
+    local to_kill
+    to_kill=$(echo "$spool_pids" | tr ' ' '\n' | grep -v '^$' | sort -un | tr '\n' ' ')
+
+    if [[ -n "$to_kill" ]]; then
+        warn "Instances existantes détectées (pids: $to_kill) — arrêt..."
+        kill $to_kill 2>/dev/null || true
         sleep 2
-        # SIGKILL sur les survivants
-        local survivors
-        survivors=$(echo "$all_pids" | xargs -I{} sh -c 'kill -0 {} 2>/dev/null && echo {}' 2>/dev/null || true)
-        if [[ -n "$survivors" ]]; then
-            echo "$survivors" | xargs kill -9 2>/dev/null || true
-        fi
-        ok "Toutes les instances arrêtées."
+        for pid in $to_kill; do
+            kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+        done
+        ok "Processus arrêté"
     fi
     rm -f "$PID_FILE"
 }
