@@ -122,7 +122,7 @@ kill_all_instances() {
         done
         ok "Processus arrêté"
     fi
-    rm -f "$PID_FILE"
+    rm -f "$PID_FILE" 2>/dev/null || sudo rm -f "$PID_FILE" 2>/dev/null || true
 }
 
 stop_daemon() {
