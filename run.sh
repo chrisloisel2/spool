@@ -532,7 +532,13 @@ def main(stdscr):
         stdscr.refresh()
         time.sleep(1.0)
 
-curses.wrapper(main)
+try:
+    curses.wrapper(main)
+except Exception as e:
+    import traceback
+    print(f"\n[TUI ERROR] {e}", flush=True)
+    traceback.print_exc()
+    input("Appuie sur Entrée pour quitter...")
 PYEOF
 }
 
