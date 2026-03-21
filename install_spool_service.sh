@@ -95,7 +95,7 @@ cat > "$ENV_FILE" <<'EOF'
 # Credentials NAS (SFTP)
 NAS_HOST=192.168.88.82
 NAS_PORT=22
-NAS_USER=root
+NAS_USER=sftpuser
 NAS_PASS=Exori@2026!
 
 # Kafka

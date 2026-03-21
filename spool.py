@@ -50,12 +50,12 @@ RETRY_BACKOFF = 1  # TURBO: backoff réduit à 1s
 # NAS (destination finale)
 NAS_HOST = "192.168.88.82"
 NAS_PORT = 22
-NAS_USER = "root"
+NAS_USER = "sftpuser"
 NAS_PASS = "Exori@2026!"
 
-SFTP_BASE_DIR = "/data/INBOX/bronze"
+SFTP_BASE_DIR = "/inbox"
 LANDING_ZONE = ""
-QUARANTINE_ZONE = "/data/INBOX/quarantine"
+QUARANTINE_ZONE = "/inbox/quarantine"
 
 DELETE_LOCAL_AFTER_SUCCESS = True
 COPY_TO_NAS_QUARANTINE = True

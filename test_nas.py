@@ -23,9 +23,9 @@ except ImportError:
 # ── Config ────────────────────────────────────────────────────────────────────
 NAS_HOST  = "192.168.88.82"
 NAS_PORT  = 22
-NAS_USER  = "root"
+NAS_USER  = "sftpuser"
 NAS_PASS  = "Exori@2026!"
-NAS_DIR   = "/data/INBOX"
+NAS_DIR   = "/inbox"
 # ─────────────────────────────────────────────────────────────────────────────
 
 OK   = "\033[92m[OK]\033[0m"
@@ -85,7 +85,7 @@ except Exception as e:
     sys.exit(1)
 
 
-# ── 4. Stat /data/INBOX ───────────────────────────────────────────────────────
+# ── 4. Stat /inbox ────────────────────────────────────────────────────────────
 step(f"4. Vérification de {NAS_DIR}")
 try:
     attr = sftp.stat(NAS_DIR)
@@ -95,7 +95,7 @@ except Exception as e:
     info("→ Le répertoire n'existe peut-être pas sur le NAS")
 
 
-# ── 5. Listdir /data/INBOX ────────────────────────────────────────────────────
+# ── 5. Listdir /inbox ─────────────────────────────────────────────────────────
 step(f"5. Listdir {NAS_DIR}")
 try:
     entries = sftp.listdir(NAS_DIR)
@@ -119,8 +119,8 @@ except Exception as e:
     info("→ C'est ici que ça plante normalement — problème de permissions")
     info(f"→ L'utilisateur '{NAS_USER}' n'a pas le droit d'écrire dans {NAS_DIR}")
     info("→ Solutions :")
-    info("    ssh root@192.168.88.82 'chmod 775 /data/INBOX && chown root:domain\\ users /data/INBOX'")
-    info("    ou ajouter admin1 au groupe qui a RWX sur /data/INBOX")
+    info("    Sur le NAS : chown sftpuser:sftpuser /home/sftpuser/inbox && chmod 755 /home/sftpuser/inbox")
+    info("    ou vérifier que /run/sshd existe et que le service SSH est actif")
     sftp.close()
     ssh.close()
     sys.exit(1)
@@ -171,12 +171,13 @@ except Exception as e:
 # ── 10. Espace disque ─────────────────────────────────────────────────────────
 step("10. Espace disque NAS")
 try:
-    _, stdout, _ = ssh.exec_command("df -h /data")
-    out = stdout.read().decode().strip()
-    for line in out.splitlines():
-        info(line)
+    vfs = sftp.statvfs(NAS_DIR)
+    total_gb = vfs.f_blocks * vfs.f_bsize / (1024 ** 3)
+    free_gb  = vfs.f_bavail * vfs.f_bsize / (1024 ** 3)
+    used_pct = int((1 - vfs.f_bavail / vfs.f_blocks) * 100) if vfs.f_blocks else 0
+    ok(f"Total: {total_gb:.1f} GB  |  Libre: {free_gb:.1f} GB  |  Utilisé: {used_pct}%")
 except Exception as e:
-    fail(f"df échoué : {e}")
+    fail(f"statvfs échoué : {e}")
 
 
 sftp.close()

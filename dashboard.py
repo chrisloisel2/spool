@@ -20,9 +20,9 @@ QUARANTINE_DIR= "/srv/exoria/quarantine"
 
 NAS_HOST      = "192.168.88.82"
 NAS_PORT      = 22
-NAS_USER      = "root"
+NAS_USER      = "sftpuser"
 NAS_PASS      = "Exori@2026!"
-NAS_INBOX     = "/data/INBOX/bronze"
+NAS_INBOX     = "/inbox"
 # ─────────────────────────────────────────────────────────────────────────────
 
 RESET  = "\033[0m"
@@ -108,10 +108,16 @@ def nas_stats():
             entries = []
             count = -1
 
-        # Espace disque via df
-        _, stdout, _ = ssh.exec_command(f"df -h {NAS_INBOX}")
-        df_out = stdout.read().decode().strip().splitlines()
-        df_line = df_out[1] if len(df_out) > 1 else ""
+        # Espace disque via statvfs (pas de shell avec chroot SFTP)
+        df_line = ""
+        try:
+            vfs = sftp.statvfs(NAS_INBOX)
+            total_gb = vfs.f_blocks * vfs.f_bsize / (1024 ** 3)
+            free_gb  = vfs.f_bavail * vfs.f_bsize / (1024 ** 3)
+            used_pct = int((1 - vfs.f_bavail / vfs.f_blocks) * 100) if vfs.f_blocks else 0
+            df_line  = f"{total_gb:.1f}G total  {free_gb:.1f}G libre  {used_pct}% utilisé"
+        except Exception:
+            pass
 
         sftp.close()
         ssh.close()

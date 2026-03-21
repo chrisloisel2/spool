@@ -13,9 +13,9 @@ DB_PATH="/srv/exoria/queue.db"
 LOG_DIR="/srv/exoria/logs"
 NAS_HOST="192.168.88.82"
 NAS_PORT="22"
-NAS_USER="root"
+NAS_USER="sftpuser"
 NAS_PASS="Exori@2026!"
-NAS_BASE="/data/INBOX/bronze"
+NAS_BASE="/inbox"
 KAFKA_BROKER="192.168.88.4:9092"
 RABBITMQ_HOST="192.168.88.246"
 PYTHON="$(command -v python3)"
@@ -232,7 +232,7 @@ try:
     # Vérifier les répertoires de base
     dirs_ok = []
     dirs_fail = []
-    for d in ["$NAS_BASE", "/data/INBOX/quarantine"]:
+    for d in ["$NAS_BASE", "/inbox/quarantine"]:
         try:
             sftp.stat(d)
             dirs_ok.append(d)

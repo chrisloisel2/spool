@@ -25,10 +25,10 @@ DB_PATH="/srv/exoria/queue.db"
 
 NAS_HOST="192.168.88.82"
 NAS_PORT="22"
-NAS_USER="root"
+NAS_USER="sftpuser"
 NAS_PASS="Exori@2026!"
-NAS_BASE="/data/INBOX/bronze"
-NAS_QUARANTINE="/data/INBOX/quarantine"
+NAS_BASE="/inbox"
+NAS_QUARANTINE="/inbox/quarantine"
 
 # ── ARGS ──────────────────────────────────────────────────────────────────────
 DELETE=0
