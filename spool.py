@@ -36,7 +36,7 @@ QUARANTINE_DIR = "/srv/exoria/quarantine"
 DB_PATH = "/srv/exoria/queue.db"
 
 SCAN_INTERVAL = 0    # pas de pause entre batches si la queue est vide
-SCAN_QC_WORKERS = 32 # threads parallèles pour le quality check (fix+files+sanity uniquement, pas ffmpeg)
+SCAN_QC_WORKERS = 16 # threads parallèles pour le quality check (fix+files+sanity uniquement, pas ffmpeg)
 SCAN_BATCH_SIZE = 200 # sessions par batch — assez grand pour alimenter 16 workers
 
 # Nombre de workers NAS en parallèle.
