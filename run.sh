@@ -79,8 +79,13 @@ start_daemon() {
 
     info "Démarrage du daemon spool..."
 
-    # Lance en arrière-plan, stdout/stderr → log
-    nohup "$PYTHON" -u "$SPOOL_PY" >> "$LOG_FILE" 2>&1 &
+    # Empêche la mise en veille et l'extinction d'écran tant que le daemon tourne
+    if command -v systemd-inhibit &>/dev/null; then
+        nohup systemd-inhibit --what=sleep:idle:handle-lid-switch --who="spool" --why="Transfert de données en cours" \
+            "$PYTHON" -u "$SPOOL_PY" >> "$LOG_FILE" 2>&1 &
+    else
+        nohup "$PYTHON" -u "$SPOOL_PY" >> "$LOG_FILE" 2>&1 &
+    fi
     local pid=$!
     echo "$pid" > "$PID_FILE"
 
